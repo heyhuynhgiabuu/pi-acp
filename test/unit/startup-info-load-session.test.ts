@@ -28,6 +28,7 @@ test('PiAcpAgent: does not emit startup info on loadSession', async () => {
       onEvent: () => () => {},
       getMessages: async () => ({ messages: [] }),
       getAvailableModels: async () => ({ models: [] }),
+      getAvailableThinkingLevels: async () => null,
       getState: async () => ({ thinkingLevel: 'medium' })
     } as any
   }

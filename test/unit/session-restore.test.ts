@@ -146,6 +146,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
           { provider: 'test', id: 'beta', name: 'Beta' }
         ]
       }),
+      getAvailableThinkingLevels: async () => null,
       getState: async () => state,
       async setModel(provider: string, modelId: string) {
         setModelCalls.push({ provider, modelId })

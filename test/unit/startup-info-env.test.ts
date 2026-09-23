@@ -40,6 +40,9 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
         async getAvailableModels() {
           return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
         },
+        async getAvailableThinkingLevels() {
+          return null
+        },
         async getState() {
           return {
             thinkingLevel: 'medium',

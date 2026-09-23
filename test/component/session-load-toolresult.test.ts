@@ -30,6 +30,7 @@ test('PiAcpAgent: loadSession replays toolResult as tool_call + tool_call_update
         ]
       }),
       getAvailableModels: async () => ({ models: [] }),
+      getAvailableThinkingLevels: async () => null,
       getState: async () => ({ thinkingLevel: 'medium' })
     } as any
   }

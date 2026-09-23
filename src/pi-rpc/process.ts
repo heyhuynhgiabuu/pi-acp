@@ -36,7 +36,8 @@ type PiRpcCommand =
   | { type: 'get_available_models'; id?: string }
   | { type: 'set_model'; id?: string; provider: string; modelId: string }
   // Thinking
-  | { type: 'set_thinking_level'; id?: string; level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' }
+  | { type: 'set_thinking_level'; id?: string; level: string }
+  | { type: 'get_available_thinking_levels'; id?: string }
   // Modes
   | { type: 'set_follow_up_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
   | { type: 'set_steering_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
@@ -283,7 +284,25 @@ export class PiRpcProcess {
     return res.data
   }
 
-  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<void> {
+  async getAvailableThinkingLevels(): Promise<string[] | null> {
+    const res = await this.request({ type: 'get_available_thinking_levels' })
+    if (!res.success) {
+      if (
+        res.error &&
+        /unknown.*command|command.*unknown/i.test(res.error) &&
+        res.error.includes('get_available_thinking_levels')
+      )
+        return null
+      throw new Error(`pi get_available_thinking_levels failed: ${res.error ?? JSON.stringify(res.data)}`)
+    }
+
+    const data = res.data as { levels?: unknown } | null | undefined
+    return Array.isArray(data?.levels)
+      ? data.levels.filter((level): level is string => typeof level === 'string' && level.length > 0)
+      : []
+  }
+
+  async setThinkingLevel(level: string): Promise<void> {
     const res = await this.request({ type: 'set_thinking_level', level })
     if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
   }

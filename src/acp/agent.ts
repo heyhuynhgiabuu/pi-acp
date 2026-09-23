@@ -27,6 +27,7 @@ import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
+import { findPiChangelogPath, getPiCommandVersion } from '../pi-rpc/command.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
@@ -46,12 +47,11 @@ import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-setti
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
-import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 type AdvertisedModel = {
   modelId: string
   name: string
@@ -346,13 +346,21 @@ export class PiAcpAgent implements ACPAgent {
       )
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
-      state,
-      availableModels
-    })
+    let sessionConfiguration: Awaited<ReturnType<typeof getSessionConfiguration>>
+    try {
+      sessionConfiguration = await getSessionConfiguration(session.proc, {
+        state,
+        availableModels
+      })
+    } catch (error: unknown) {
+      this.cleanupFailedNewSession(session.sessionId, state)
+      throw error
+    }
+    const { configOptions, models, modes } = sessionConfiguration
 
+    const piVersion = getPiCommandVersion()
     const quietStartup = getQuietStartup(params.cwd)
-    const updateNotice = buildUpdateNotice()
+    const updateNotice = buildUpdateNotice(piVersion)
 
     // If quietStartup is enabled, suppress the full "startup info" prelude, but still surface
     // the "New version available" notice (if any) since it's high-signal and actionable.
@@ -363,6 +371,7 @@ export class PiAcpAgent implements ACPAgent {
       : buildStartupInfo({
           cwd: params.cwd,
           fileCommands,
+          piVersion,
           updateNotice
         })
 
@@ -661,42 +670,7 @@ export class PiAcpAgent implements ACPAgent {
 
       if (cmd === 'changelog') {
         // Read pi's installed CHANGELOG.md. Adapter-side, no model call.
-        const findChangelog = (): string | null => {
-          // 1) Locate the installed pi package by resolving the `pi` executable.
-          // On Node installs, `pi` typically resolves to .../@earendil-works/pi-coding-agent/dist/cli.js
-          try {
-            const whichCmd = process.platform === 'win32' ? 'where' : 'which'
-            const which = spawnSync(whichCmd, ['pi'], { encoding: 'utf-8' })
-            const piPath = String(which.stdout ?? '')
-              .split(/\r?\n/)[0]
-              ?.trim()
-
-            if (piPath) {
-              const resolved = realpathSync(piPath)
-              const pkgRoot = dirname(dirname(resolved))
-              const p = join(pkgRoot, 'CHANGELOG.md')
-              if (existsSync(p)) return p
-            }
-          } catch {
-            // ignore
-          }
-
-          // 2) Fallback: ask npm where global modules live.
-          try {
-            const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf-8' })
-            const root = String(npmRoot.stdout ?? '').trim()
-            if (root) {
-              const p = join(root, '@earendil-works', 'pi-coding-agent', 'CHANGELOG.md')
-              if (existsSync(p)) return p
-            }
-          } catch {
-            // ignore
-          }
-
-          return null
-        }
-
-        const changelogPath = findChangelog()
+        const changelogPath = findPiChangelogPath()
         if (!changelogPath) {
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
@@ -1151,7 +1125,8 @@ export class PiAcpAgent implements ACPAgent {
     const session = await this.restoreSession(params.sessionId)
 
     const mode = String(params.modeId)
-    if (!isThinkingLevel(mode)) {
+    const availableLevels = await getAvailableThinkingLevels(session.proc)
+    if (!availableLevels.includes(mode)) {
       throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
     }
 
@@ -1184,7 +1159,8 @@ export class PiAcpAgent implements ACPAgent {
       await setSessionModel(session.proc, params.value)
       modelChanged = true
     } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
-      if (!isThinkingLevel(params.value)) {
+      const availableLevels = await getAvailableThinkingLevels(session.proc)
+      if (!availableLevels.includes(params.value)) {
         throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
       }
 
@@ -1208,8 +1184,12 @@ export class PiAcpAgent implements ACPAgent {
   }
 }
 
-function isThinkingLevel(x: string): x is ThinkingLevel {
-  return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
+const LEGACY_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+
+async function getAvailableThinkingLevels(proc: PiRpcProcess): Promise<string[]> {
+  const levels = await proc.getAvailableThinkingLevels()
+  if (levels === null) return LEGACY_THINKING_LEVELS
+  return levels.length ? [...new Set(levels)] : ['off']
 }
 
 async function getThinkingState(
@@ -1223,9 +1203,7 @@ async function getThinkingState(
   }>
   currentModeId: string
 }> {
-  // Ask pi for current thinking level.
-  let current: ThinkingLevel = 'medium'
-
+  const levels = await getAvailableThinkingLevels(proc)
   const state =
     pre?.state ??
     (await (async () => {
@@ -1236,14 +1214,17 @@ async function getThinkingState(
       }
     })())
 
-  const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
-  if (tl && isThinkingLevel(tl)) current = tl
-
-  const available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  const requestedLevel = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
+  const currentModeId =
+    requestedLevel && levels.includes(requestedLevel)
+      ? requestedLevel
+      : levels.includes('medium')
+        ? 'medium'
+        : (levels[0] ?? 'off')
 
   return {
-    currentModeId: current,
-    availableModes: available.map(id => ({
+    currentModeId,
+    availableModes: levels.map(id => ({
       id,
       name: `Thinking: ${id}`,
       description: null
@@ -1467,16 +1448,10 @@ function compareSemver(a: string, b: string): number {
   return 0
 }
 
-function buildUpdateNotice(): string | null {
+function buildUpdateNotice(installed: string | null): string | null {
   // Best-effort update check against npm registry.
   // Important: keep it fast to not slow down session/new.
   try {
-    const piVersion = spawnSync('pi', ['--version'], { encoding: 'utf-8' })
-    const installed = (String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim()).replace(
-      /^v/i,
-      ''
-    )
-
     if (!installed || !isSemver(installed)) return null
 
     const latestRes = spawnSync('npm', ['view', '@earendil-works/pi-coding-agent', 'version'], {
@@ -1499,6 +1474,7 @@ function buildUpdateNotice(): string | null {
 function buildStartupInfo(opts: {
   cwd: string
   fileCommands: ReturnType<typeof loadSlashCommands>
+  piVersion: string | null
   updateNotice: string | null
 }): string {
   void opts.fileCommands
@@ -1506,19 +1482,10 @@ function buildStartupInfo(opts: {
   const md: string[] = []
 
   // pi version header
-  try {
-    const piVersion = spawnSync('pi', ['--version'], { encoding: 'utf-8' })
-    const installed = (String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim()).replace(
-      /^v/i,
-      ''
-    )
-    if (installed) {
-      md.push(`pi v${installed}`)
-      md.push('---')
-      md.push('')
-    }
-  } catch {
-    // ignore
+  if (opts.piVersion) {
+    md.push(`pi v${opts.piVersion}`)
+    md.push('---')
+    md.push('')
   }
 
   const addSection = (title: string, items: string[]) => {

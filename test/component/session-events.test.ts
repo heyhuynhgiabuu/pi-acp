@@ -508,6 +508,136 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: '/tmp/test.txt' }])
 })
 
+test('PiAcpSession: reads legacy tool calls from partial assistant-message content', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      contentIndex: 0,
+      partial: {
+        content: [{ id: 't-legacy', name: 'write', arguments: { path: '/tmp/legacy.txt', content: 'hello' } }]
+      }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).toolCallId, 't-legacy')
+  assert.deepEqual((conn.updates[0]!.update as any).rawInput, { path: '/tmp/legacy.txt', content: 'hello' })
+})
+
+test('PiAcpSession: streams current delta-only Pi tool-call events through execution start', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_start', contentIndex: 0, id: 't1', toolName: 'write' }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, delta: '{"path":"/tmp/' }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, delta: 'target.txt","content":"ok"}' }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_end',
+      contentIndex: 0,
+      toolCall: { id: 't1', name: 'write', arguments: { path: '/tmp/target.txt', content: 'ok' } }
+    }
+  })
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 't1',
+    toolName: 'write',
+    args: { path: '/tmp/target.txt', content: 'ok' }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(
+    conn.updates.map(({ update }) => update.sessionUpdate),
+    ['tool_call', 'tool_call_update', 'tool_call_update', 'tool_call_update', 'tool_call_update']
+  )
+  assert.equal((conn.updates[0]!.update as any).toolCallId, 't1')
+  assert.equal((conn.updates[0]!.update as any).title, 'write')
+  assert.deepEqual((conn.updates[2]!.update as any).rawInput, { path: '/tmp/target.txt', content: 'ok' })
+  assert.deepEqual((conn.updates[3]!.update as any).rawInput, { path: '/tmp/target.txt', content: 'ok' })
+  assert.equal((conn.updates[4]!.update as any).status, 'in_progress')
+})
+
+test('PiAcpSession: keeps interleaved tool argument deltas keyed by content index', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_start', contentIndex: 0, id: 't1', toolName: 'write' }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_start', contentIndex: 1, id: 't2', toolName: 'write' }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, delta: '{"path":"/tmp/first.txt"}' }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 1, delta: '{"path":"/tmp/second.txt"}' }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(
+    conn.updates.map(({ update }) => [update.sessionUpdate, (update as any).toolCallId]),
+    [
+      ['tool_call', 't1'],
+      ['tool_call', 't2'],
+      ['tool_call_update', 't1'],
+      ['tool_call_update', 't2']
+    ]
+  )
+  assert.deepEqual((conn.updates[2]!.update as any).rawInput, { path: '/tmp/first.txt' })
+  assert.deepEqual((conn.updates[3]!.update as any).rawInput, { path: '/tmp/second.txt' })
+})
+
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -841,7 +971,7 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
   assert.equal(reason, 'end_turn')
 })
 
-test('PiAcpSession: tags extension notify chunks with severity in _meta', async () => {
+test('PiAcpSession: renders extension notifications as separated italic blocks without a response', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -858,7 +988,7 @@ test('PiAcpSession: tags extension notify chunks with severity in _meta', async 
     type: 'extension_ui_request',
     id: 'n1',
     method: 'notify',
-    message: 'MCP: connection failed',
+    message: 'MCP: connection failed\nretrying',
     notifyType: 'error'
   })
 
@@ -867,13 +997,16 @@ test('PiAcpSession: tags extension notify chunks with severity in _meta', async 
   assert.equal(conn.updates.length, 1)
   assert.deepEqual(conn.updates[0]!.update, {
     sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: 'MCP: connection failed' },
+    content: {
+      type: 'text',
+      text: '\n\n> _MCP: connection failed_\n> _retrying_\n\n'
+    },
     _meta: { piAcp: { notify: { level: 'error' } } }
   })
-  assert.deepEqual(proc.extensionUiResponses[0], { id: 'n1', cancelled: true })
+  assert.deepEqual(proc.extensionUiResponses, [])
 })
 
-test('PiAcpSession: defaults notify severity to info when notifyType is absent', async () => {
+test('PiAcpSession: defaults extension notification severity to info and renders it separately', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -896,9 +1029,70 @@ test('PiAcpSession: defaults notify severity to info when notifyType is absent',
   await new Promise(r => setTimeout(r, 0))
 
   assert.equal(conn.updates.length, 1)
+  assert.equal((conn.updates[0]!.update as any).content.text, '\n\n> _heads up_\n\n')
   assert.deepEqual((conn.updates[0]!.update as any)._meta, {
     piAcp: { notify: { level: 'info' } }
   })
+  assert.deepEqual(proc.extensionUiResponses, [])
+})
+
+test('PiAcpSession: maps extension setTitle to ACP session title without a response', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'extension_ui_request', id: 'title-1', method: 'setTitle', title: 'Pi workspace' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(
+    conn.updates.map(update => update.update),
+    [{ sessionUpdate: 'session_info_update', title: 'Pi workspace' }]
+  )
+  assert.deepEqual(proc.extensionUiResponses, [])
+})
+
+test('PiAcpSession: ignores unsupported fire-and-forget extension UI methods without responding', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'status-1',
+    method: 'setStatus',
+    statusKey: 'usage',
+    statusText: 'TPS 38.8 tok/s'
+  })
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'widget-1',
+    method: 'setWidget',
+    widgetKey: 'summary',
+    widgetLines: ['Line 1']
+  })
+  proc.emit({ type: 'extension_ui_request', id: 'editor-1', method: 'set_editor_text', text: 'Draft text' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(conn.updates, [])
+  assert.deepEqual(proc.extensionUiResponses, [])
 })
 
 test('PiAcpSession: emits usage_update from contextUsage before resolving prompt on agent_settled', async () => {

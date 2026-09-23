@@ -41,8 +41,8 @@ Make sure pi is installed
 npm install -g @earendil-works/pi-coding-agent
 ```
 
-- Node.js 22+
-- `pi` v0.80.4+ installed and available on your `PATH` (the adapter runs the `pi` executable)
+- Node.js 22.19+ to run the current Pi v0.87.1 compatibility baseline
+- `pi` v0.80.4+ installed and available on your `PATH` (the adapter runs the `pi` executable). Compatibility is verified against Pi v0.87.1; older versions fall back to the legacy thinking-level list when they do not expose that RPC command.
 - Configure `pi` separately for your model providers/API keys
 
 ## Install
@@ -115,6 +115,7 @@ Point your ACP client to the built `dist/index.js`:
 
 ### Environment variables
 
+- `PI_ACP_PI_COMMAND` optionally selects the Pi executable used for RPC sessions, terminal login, version checks, and `/changelog`. By default, `pi` (or `pi.cmd` on Windows) is resolved from `PATH`.
 - `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
 - Default: unset/any other value means `false`.
 - When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.

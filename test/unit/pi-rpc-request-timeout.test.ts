@@ -135,3 +135,59 @@ test('PiRpcProcess: responses with unknown ids are dropped while real events are
 
   assert.deepEqual(events, [{ type: 'agent_start' }])
 })
+
+test('PiRpcProcess: getAvailableThinkingLevels preserves future levels and filters malformed values', async () => {
+  const { child, stdout, written } = makeFakeChild()
+  const proc = makeProcess(child)
+
+  const levelsPromise = proc.getAvailableThinkingLevels()
+  const sent = JSON.parse(written[0]!) as { id: string; type: string }
+
+  assert.equal(sent.type, 'get_available_thinking_levels')
+  await writeLine(stdout, {
+    type: 'response',
+    id: sent.id,
+    command: 'get_available_thinking_levels',
+    success: true,
+    data: { levels: ['off', 'max', 'experimental', 42, null, ''] }
+  })
+
+  assert.deepEqual(await levelsPromise, ['off', 'max', 'experimental'])
+})
+
+test('PiRpcProcess: getAvailableThinkingLevels returns null when Pi does not support the command', async () => {
+  const { child, stdout, written } = makeFakeChild()
+  const proc = makeProcess(child)
+
+  const levelsPromise = proc.getAvailableThinkingLevels()
+  const sent = JSON.parse(written[0]!) as { id: string; type: string }
+
+  await writeLine(stdout, {
+    type: 'response',
+    id: sent.id,
+    command: 'get_available_thinking_levels',
+    success: false,
+    error: 'Unknown RPC command: get_available_thinking_levels'
+  })
+
+  assert.equal(await levelsPromise, null)
+})
+
+test('PiRpcProcess: getAvailableThinkingLevels surfaces unexpected RPC failures', async () => {
+  const { child, stdout, written } = makeFakeChild()
+  const proc = makeProcess(child)
+
+  const levelsPromise = proc.getAvailableThinkingLevels()
+  const rejection = assert.rejects(levelsPromise, /RPC failure/)
+  const sent = JSON.parse(written[0]!) as { id: string; type: string }
+
+  await writeLine(stdout, {
+    type: 'response',
+    id: sent.id,
+    command: 'get_available_thinking_levels',
+    success: false,
+    error: 'RPC failure'
+  })
+
+  await rejection
+})

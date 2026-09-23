@@ -90,6 +90,7 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
         }),
         getSessionStats: async () => ({ contextUsage: { tokens: 12_345, contextWindow: 200_000 } }),
         getAvailableModels: async () => ({ models: [] }),
+        getAvailableThinkingLevels: async () => null,
         getState: async () => ({ thinkingLevel: 'medium' })
       } as any
     }

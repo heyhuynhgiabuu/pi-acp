@@ -103,6 +103,23 @@ function getToolPath(args: unknown): string | undefined {
   return undefined
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function parseToolCallInput(argumentsValue: unknown, partialArgs: unknown): unknown {
+  if (typeof argumentsValue === 'object' && argumentsValue !== null) return argumentsValue
+  if (typeof partialArgs !== 'string' || !partialArgs) return undefined
+
+  try {
+    return JSON.parse(partialArgs) as unknown
+  } catch {
+    return { partialArgs }
+  }
+}
+
 // Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
 // legacy top-level oldText/newText still accepted. Pi also normalizes stringified edits.
 // https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/tools/edit.ts
@@ -299,6 +316,7 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  private streamedToolCalls = new Map<number, { id: string; name: string; partialArgs: string }>()
 
   // pi can emit multiple `turn_end` and `agent_end` events for a single user prompt
   // when retry, compaction, or queued continuations run. The session-level prompt
@@ -584,95 +602,102 @@ export class PiAcpSession {
 
     switch (type) {
       case 'message_update': {
-        const ame = (ev as any).assistantMessageEvent
+        const event = asRecord(ev.assistantMessageEvent)
+        if (!event) break
 
         // Stream assistant text.
-        if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
+        if (event.type === 'text_delta' && typeof event.delta === 'string') {
           this.emit({
             sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: ame.delta } satisfies ContentBlock
+            content: { type: 'text', text: event.delta } satisfies ContentBlock
           })
           break
         }
 
-        if (ame?.type === 'thinking_delta' && typeof ame.delta === 'string') {
+        if (event.type === 'thinking_delta' && typeof event.delta === 'string') {
           this.emit({
             sessionUpdate: 'agent_thought_chunk',
-            content: { type: 'text', text: ame.delta } satisfies ContentBlock
+            content: { type: 'text', text: event.delta } satisfies ContentBlock
           })
           break
         }
 
-        // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
-        // while the model is still streaming tool call args.
-        if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
-          const toolCall =
-            // pi sometimes includes the tool call directly on the event
-            (ame as any)?.toolCall ??
-            // ...and always includes it in the partial assistant message at contentIndex
-            (ame as any)?.partial?.content?.[(ame as any)?.contentIndex ?? 0]
-
-          const toolCallId = String((toolCall as any)?.id ?? '')
-          const toolName = String((toolCall as any)?.name ?? 'tool')
-
-          if (toolCallId) {
-            const rawInput =
-              (toolCall as any)?.arguments && typeof (toolCall as any).arguments === 'object'
-                ? (toolCall as any).arguments
-                : (() => {
-                    const s = String((toolCall as any)?.partialArgs ?? '')
-                    if (!s) return undefined
-                    try {
-                      return JSON.parse(s)
-                    } catch {
-                      return { partialArgs: s }
-                    }
-                  })()
-
-            const locations = toToolCallLocations(rawInput, this.cwd)
-            const existingStatus = this.currentToolCalls.get(toolCallId)
-            // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
-            const status = existingStatus ?? 'pending'
-
-            if (isBashTool(toolName)) {
-              if (!existingStatus) this.currentToolCalls.set(toolCallId, 'pending')
-              this.emitBashToolCall({
-                sessionUpdate: existingStatus ? 'tool_call_update' : 'tool_call',
-                toolCallId,
-                toolName,
-                args: rawInput,
-                status,
-                locations,
-                includeTerminal: !existingStatus
-              })
-            } else if (!existingStatus) {
-              this.currentToolCalls.set(toolCallId, 'pending')
-              this.emit({
-                sessionUpdate: 'tool_call',
-                toolCallId,
-                title: toolName,
-                kind: toToolKind(toolName),
-                status,
-                locations,
-                rawInput
-              })
-            } else {
-              // Best-effort: keep rawInput updated while args are streaming.
-              // Keep the existing status (pending or in_progress).
-              this.emit({
-                sessionUpdate: 'tool_call_update',
-                toolCallId,
-                status,
-                locations,
-                rawInput
-              })
-            }
-          }
-
+        if (event.type !== 'toolcall_start' && event.type !== 'toolcall_delta' && event.type !== 'toolcall_end') {
           break
         }
 
-        // Ignore other delta/event types for now.
+        const contentIndex =
+          typeof event.contentIndex === 'number' && Number.isSafeInteger(event.contentIndex)
+            ? event.contentIndex
+            : undefined
+        const partialMessage = asRecord(event.partial)
+        const partialContent = Array.isArray(partialMessage?.content) ? partialMessage.content : []
+        let toolCall = asRecord(event.toolCall) ?? asRecord(partialContent[contentIndex ?? 0])
+        let streamed = contentIndex === undefined ? undefined : this.streamedToolCalls.get(contentIndex)
+
+        if (event.type === 'toolcall_start') {
+          const id = typeof event.id === 'string' ? event.id : toolCall?.id
+          const name = typeof event.toolName === 'string' ? event.toolName : toolCall?.name
+          if (typeof id === 'string' && typeof name === 'string') {
+            streamed = { id, name, partialArgs: '' }
+            if (contentIndex !== undefined) this.streamedToolCalls.set(contentIndex, streamed)
+            toolCall ??= { id, name }
+          }
+        } else if (event.type === 'toolcall_delta' && streamed && typeof event.delta === 'string') {
+          streamed.partialArgs += event.delta
+          toolCall = { id: streamed.id, name: streamed.name, partialArgs: streamed.partialArgs }
+        } else if (event.type === 'toolcall_end') {
+          if (!toolCall && streamed) {
+            toolCall = { id: streamed.id, name: streamed.name, partialArgs: streamed.partialArgs }
+          }
+          if (contentIndex !== undefined) this.streamedToolCalls.delete(contentIndex)
+        }
+
+        const toolCallId = typeof toolCall?.id === 'string' ? toolCall.id : (streamed?.id ?? '')
+        const toolName = typeof toolCall?.name === 'string' ? toolCall.name : (streamed?.name ?? 'tool')
+
+        if (toolCallId) {
+          const rawInput = parseToolCallInput(toolCall?.arguments, toolCall?.partialArgs)
+          const locations = toToolCallLocations(rawInput, this.cwd)
+          const existingStatus = this.currentToolCalls.get(toolCallId)
+          // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
+          const status = existingStatus ?? 'pending'
+
+          if (isBashTool(toolName)) {
+            if (!existingStatus) this.currentToolCalls.set(toolCallId, 'pending')
+            this.emitBashToolCall({
+              sessionUpdate: existingStatus ? 'tool_call_update' : 'tool_call',
+              toolCallId,
+              toolName,
+              args: rawInput,
+              status,
+              locations,
+              includeTerminal: !existingStatus
+            })
+          } else if (!existingStatus) {
+            this.currentToolCalls.set(toolCallId, 'pending')
+            this.emit({
+              sessionUpdate: 'tool_call',
+              toolCallId,
+              title: toolName,
+              kind: toToolKind(toolName),
+              status,
+              locations,
+              rawInput
+            })
+          } else {
+            // Best-effort: keep rawInput updated while args are streaming.
+            // Keep the existing status (pending or in_progress).
+            this.emit({
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status,
+              locations,
+              rawInput
+            })
+          }
+        }
+
         break
       }
 
@@ -942,14 +967,27 @@ export class PiAcpSession {
     }
 
     if (method === 'notify') {
+      const level = ev.notifyType === 'warning' || ev.notifyType === 'error' ? ev.notifyType : 'info'
       this.emit({
         sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: stringProp(ev, 'message') ?? 'Pi notification' } satisfies ContentBlock,
-        _meta: { piAcp: { notify: { level: stringProp(ev, 'notifyType') ?? 'info' } } }
+        content: {
+          type: 'text',
+          text: formatExtensionNotification(stringProp(ev, 'message') ?? 'Pi notification')
+        } satisfies ContentBlock,
+        _meta: { piAcp: { notify: { level } } }
       })
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
     }
+
+    if (method === 'setTitle') {
+      const title = stringProp(ev, 'title')
+      if (title !== null) this.emit({ sessionUpdate: 'session_info_update', title })
+      return
+    }
+
+    // Pi status, widget, and draft-editor methods are fire-and-forget. ACP has no
+    // equivalent Zed surface for them, so ignore them without replying to Pi.
+    if (method === 'setStatus' || method === 'setWidget' || method === 'set_editor_text') return
 
     await this.proc.sendExtensionUiResponse({ id, cancelled: true })
   }
@@ -1032,6 +1070,15 @@ function extensionUiToolCall(id: string, ev: PiRpcEvent) {
 function stringProp(source: Record<string, unknown>, key: string): string | null {
   const value = source[key]
   return typeof value === 'string' ? value : null
+}
+
+function formatExtensionNotification(message: string): string {
+  const quotedMessage = message
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map(line => `> _${line}_`)
+    .join('\n')
+  return `\n\n${quotedMessage}\n\n`
 }
 
 function optionIndex(optionId: string): number | null {

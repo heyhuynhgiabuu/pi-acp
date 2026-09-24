@@ -1,5 +1,13 @@
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AgentSideConnection } from '@agentclientprotocol/sdk'
 import type { PiRpcEvent, PiSessionStats } from '../../src/pi-rpc/process.js'
+
+// Every test that drives an agent shares this helper, so pointing the adapter's own
+// state directory at a temp dir here keeps test sessions out of the real
+// ~/.pi/pi-acp/session-map.json. Tests may override PI_ACP_HOME before importing this.
+process.env.PI_ACP_HOME ??= mkdtempSync(join(tmpdir(), 'pi-acp-home-'))
 
 type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 
@@ -78,6 +86,22 @@ export class FakePiRpcProcess {
     this.getSessionStatsCount += 1
     if (this.sessionStatsError) throw this.sessionStatsError
     return this.sessionStats
+  }
+
+  private exitHandlers: Array<() => void> = []
+
+  onExit(handler: () => void): () => void {
+    this.exitHandlers.push(handler)
+    return () => {
+      this.exitHandlers = this.exitHandlers.filter(h => h !== handler)
+    }
+  }
+
+  /** Simulate the pi subprocess exiting (or failing to spawn). */
+  exit(): void {
+    const handlers = this.exitHandlers
+    this.exitHandlers = []
+    for (const handler of handlers) handler()
   }
 }
 

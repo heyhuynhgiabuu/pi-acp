@@ -62,6 +62,293 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   })
 })
 
+test('PiAcpSession: surfaces visible custom messages and ignores hidden ones', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', customType: 'task-complete', display: false, content: 'hidden' }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', customType: 'task-complete', display: true, content: 'task finished' }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates[0]!.sessionId, 's1')
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'task finished' }
+  })
+})
+
+test('PiAcpSession: links a hidden pi-task session to its tool call', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const subagentSessions: string[] = []
+
+  new PiAcpSession({
+    sessionId: 'parent-session',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    onSubagentSession: sessionId => subagentSessions.push(sessionId)
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'task-call',
+    toolName: 'task',
+    args: { agent_type: 'worker' }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      customType: 'task-session',
+      display: false,
+      content: '',
+      details: { task_id: 'task-1', session_id: 'child-session' }
+    }
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'task-call',
+    isError: false,
+    result: {
+      content: [{ type: 'text', text: 'running' }],
+      details: { task_id: 'task-1', backend: 'sdk', background: true }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const linkUpdate = conn.updates.find(update => (update as any).update?._meta?.subagent_session_info) as any
+  assert.deepEqual(linkUpdate?.update?._meta, {
+    subagent_session_info: { session_id: 'child-session', message_start_index: 0 }
+  })
+  assert.deepEqual(subagentSessions, ['child-session'])
+  assert.equal(
+    conn.updates.some(update => (update as any).update?.sessionUpdate === 'agent_message_chunk'),
+    false
+  )
+})
+
+test('PiAcpSession: attaches a late background session to its completed task call', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 'parent-session',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'task-call',
+    toolName: 'task',
+    args: { agent_type: 'worker' }
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'task-call',
+    isError: false,
+    result: {
+      content: [{ type: 'text', text: 'running' }],
+      details: { task_id: 'task-2', backend: 'sdk', background: true }
+    }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      customType: 'task-session',
+      display: false,
+      content: '',
+      details: { task_id: 'task-2', session_id: 'child-session-2' }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const linkUpdates = conn.updates.filter(update => (update as any).update?._meta?.subagent_session_info) as any[]
+  assert.equal(linkUpdates.length, 1)
+  assert.equal(linkUpdates[0]!.update.toolCallId, 'task-call')
+  assert.equal(linkUpdates[0]!.update.status, 'completed')
+  assert.deepEqual(linkUpdates[0]!.update._meta, {
+    subagent_session_info: { session_id: 'child-session-2', message_start_index: 0 }
+  })
+})
+
+test('PiAcpSession: links a foreground task session while the task is still running', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const subagentSessions: string[] = []
+
+  new PiAcpSession({
+    sessionId: 'parent-session',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    onSubagentSession: sessionId => subagentSessions.push(sessionId)
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'task-call',
+    toolName: 'task',
+    args: { agent_type: 'worker' }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      customType: 'task-session',
+      display: false,
+      content: '',
+      details: {
+        task_id: 'task-1',
+        session_id: 'child-session',
+        pi_tool_call_id: 'task-call'
+      }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const linkUpdates = conn.updates.filter(update => (update as any).update?._meta?.subagent_session_info) as any[]
+  assert.equal(linkUpdates.length, 1)
+  assert.equal(linkUpdates[0]!.update.toolCallId, 'task-call')
+  assert.equal(linkUpdates[0]!.update.status, 'in_progress')
+  assert.deepEqual(linkUpdates[0]!.update._meta, {
+    subagent_session_info: { session_id: 'child-session', message_start_index: 0 }
+  })
+  assert.deepEqual(subagentSessions, ['child-session'])
+})
+
+test('PiAcpSession: links a foreground task from the live entry before the tool result', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const subagentSessions: string[] = []
+
+  new PiAcpSession({
+    sessionId: 'parent-session',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    onSubagentSession: sessionId => subagentSessions.push(sessionId)
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'task-call',
+    toolName: 'task',
+    args: { agent_type: 'worker' }
+  })
+  // pi-task's live channel: an entry, which pi emits immediately (unlike a custom
+  // message, which pi defers until the turn ends while the parent is streaming).
+  proc.emit({
+    type: 'entry_appended',
+    entry: {
+      type: 'custom',
+      customType: 'task-session',
+      data: { task_id: 'task-1', session_id: 'child-session', pi_tool_call_id: 'task-call' }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const linkUpdates = conn.updates.filter(update => (update as any).update?._meta?.subagent_session_info) as any[]
+  assert.equal(linkUpdates.length, 1)
+  assert.equal(linkUpdates[0]!.update.toolCallId, 'task-call')
+  assert.equal(linkUpdates[0]!.update.status, 'in_progress')
+  assert.deepEqual(linkUpdates[0]!.update._meta, {
+    subagent_session_info: { session_id: 'child-session', message_start_index: 0 }
+  })
+  assert.deepEqual(subagentSessions, ['child-session'])
+})
+
+test('PiAcpSession: defers an early link for an unknown tool-call id until the task result', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 'parent-session',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'task-call',
+    toolName: 'task',
+    args: { agent_type: 'worker' }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      customType: 'task-session',
+      display: false,
+      content: '',
+      details: {
+        task_id: 'task-1',
+        session_id: 'child-session',
+        pi_tool_call_id: 'stale-call'
+      }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(
+    conn.updates.some(update => (update as any).update?._meta?.subagent_session_info),
+    false,
+    'an unknown tool-call id must not be linked to an unrelated call'
+  )
+
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'task-call',
+    isError: false,
+    result: {
+      content: [{ type: 'text', text: 'done' }],
+      details: { task_id: 'task-1', backend: 'sdk', session_id: 'child-session' }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const linkUpdates = conn.updates.filter(update => (update as any).update?._meta?.subagent_session_info) as any[]
+  assert.equal(linkUpdates.length, 1)
+  assert.equal(linkUpdates[0]!.update.toolCallId, 'task-call')
+})
+
 test('PiAcpSession: emits tool_call + tool_call_update + completes', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -1293,4 +1580,45 @@ test('PiAcpSession: cancelled turn still reports cancelled after usage publish',
     conn.updates.filter(u => u.update.sessionUpdate === 'usage_update').map(u => u.update),
     [{ sessionUpdate: 'usage_update', used: 42, size: 100 }]
   )
+})
+
+test('PiAcpSession: re-links a resumed task with the same task id but a new tool call', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 'parent-session',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const taskEntry = (piToolCallId: string) => ({
+    type: 'entry_appended',
+    entry: {
+      type: 'custom',
+      customType: 'task-session',
+      data: { task_id: 'task-1', session_id: 'child-session', pi_tool_call_id: piToolCallId }
+    }
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'task', args: {} })
+  proc.emit(taskEntry('call-1'))
+  // A duplicate of the same live event must not emit a second link.
+  proc.emit(taskEntry('call-1'))
+
+  // The task was resumed with the same task id and a new parent tool call.
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'call-2', toolName: 'task', args: {} })
+  proc.emit(taskEntry('call-2'))
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const linkedToolCallIds = conn.updates
+    .map(update => (update as any).update)
+    .filter(update => update?._meta?.subagent_session_info)
+    .map(update => update.toolCallId)
+
+  assert.deepEqual(linkedToolCallIds, ['call-1', 'call-2'])
 })

@@ -10,7 +10,10 @@ import type {
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { readFileSync } from 'node:fs'
+import { readPiTaskSessionEvent, readPiTaskToolResult, subagentSessionInfoMeta } from './subagent-session.js'
+import { maxResidentSessions } from './spawn-limiter.js'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { z } from 'zod'
 import {
   PiRpcProcess,
   PiRpcSpawnError,
@@ -56,6 +59,11 @@ type QueuedTurn = {
   reject: (err: unknown) => void
 }
 
+type LinkedTaskResult = {
+  childSessionId: string
+  taskRunKey: string
+}
+
 type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
@@ -64,6 +72,31 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+
+const visibleCustomTextPartSchema = z.object({ type: z.literal('text'), text: z.string() })
+
+const visibleCustomMessageSchema = z.object({
+  role: z.literal('custom'),
+  customType: z.string().optional(),
+  display: z.literal(true),
+  details: z.unknown().optional(),
+  content: z.union([
+    z.string(),
+    z.array(z.unknown()).transform(parts =>
+      parts
+        .map(part => {
+          const textPart = visibleCustomTextPartSchema.safeParse(part)
+          return textPart.success ? textPart.data.text : ''
+        })
+        .join('')
+    )
+  ])
+})
+
+export function readVisibleCustomMessageText(value: unknown): string | null {
+  const message = visibleCustomMessageSchema.safeParse(value)
+  return message.success ? message.data.content : null
+}
 
 /**
  * Map pi's `stats.contextUsage` to an ACP `usage_update`. Returns null whenever pi
@@ -185,13 +218,254 @@ function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCal
   return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
 }
 
+/** A resumed task uses a new parent tool call and must complete independently. */
+function taskLinkKey(taskId: string, piToolCallId?: string): string {
+  return piToolCallId ? `${taskId}\u0000${piToolCallId}` : taskId
+}
+
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
   private readonly store = new SessionStore()
+  private readonly subagentParents = new Map<string, string>()
+  private readonly activeSubagentRuns = new Map<string, Set<string>>()
+  private readonly staleSubagentSessions = new Set<string>()
+  // Sessions the client worked with, oldest first, so the cap can tell which to keep warm.
+  private readonly recentlyUsed: string[] = []
+  // Client requests currently working with a session, counted because requests can overlap.
+  private readonly inFlightRequests = new Map<string, number>()
+  private readonly maxResident = maxResidentSessions()
 
   /** Dispose all sessions and their underlying pi subprocesses. */
   disposeAll(): void {
     for (const [id] of this.sessions) this.close(id)
+    this.subagentParents.clear()
+    this.activeSubagentRuns.clear()
+    this.staleSubagentSessions.clear()
+    this.inFlightRequests.clear()
+    this.recentlyUsed.length = 0
+  }
+
+  /**
+   * Mark a session as used by a client request. While a lease is held the session keeps its
+   * pi process: evicting it would reject the request's own RPC with "pi process exited".
+   * The returned release function is idempotent and must run when the request settles.
+   */
+  beginRequest(sessionId: string): () => void {
+    this.inFlightRequests.set(sessionId, (this.inFlightRequests.get(sessionId) ?? 0) + 1)
+
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+
+      const remaining = (this.inFlightRequests.get(sessionId) ?? 1) - 1
+      if (remaining > 0) this.inFlightRequests.set(sessionId, remaining)
+      else this.inFlightRequests.delete(sessionId)
+    }
+  }
+
+  private isInFlight(sessionId: string): boolean {
+    return (this.inFlightRequests.get(sessionId) ?? 0) > 0
+  }
+
+  registerSubagentSession(parentSessionId: string, childSessionId: string): void {
+    if (!parentSessionId || !childSessionId || parentSessionId === childSessionId) return
+    this.subagentParents.set(childSessionId, parentSessionId)
+  }
+
+  isSubagentSession(sessionId: string): boolean {
+    return this.subagentParents.has(sessionId)
+  }
+
+  markSubagentSessionActive(childSessionId: string, taskRunKey: string): void {
+    if (!childSessionId || !taskRunKey) return
+    const activeRuns = this.activeSubagentRuns.get(childSessionId) ?? new Set<string>()
+    activeRuns.add(taskRunKey)
+    this.activeSubagentRuns.set(childSessionId, activeRuns)
+    this.staleSubagentSessions.delete(childSessionId)
+  }
+
+  markSubagentSessionCompleted(childSessionId: string, taskRunKey: string): void {
+    const activeRuns = this.activeSubagentRuns.get(childSessionId)
+    if (!activeRuns?.delete(taskRunKey) || activeRuns.size > 0) return
+    this.activeSubagentRuns.delete(childSessionId)
+    this.releaseOrMarkStale(childSessionId)
+  }
+
+  /**
+   * Give a child session back to the client: free its viewer process when nothing is using
+   * it, otherwise mark it stale so the next write recycles it before writing.
+   */
+  private releaseOrMarkStale(childSessionId: string): void {
+    if (this.isInFlight(childSessionId) || !this.releaseIdleSession(childSessionId)) {
+      this.staleSubagentSessions.add(childSessionId)
+    }
+  }
+
+  /**
+   * Mark `sessionId` as the one the client is working with and evict idle sessions beyond
+   * the resident cap.
+   */
+  touch(sessionId: string): void {
+    this.rememberRecentlyUsed(sessionId)
+    this.trimResidentSessions()
+  }
+
+  /**
+   * Keep at most `maxResident` processes: the most recently used sessions and their lineage
+   * stay, everything else idle goes oldest-first. This is what stops a client that asks for
+   * many sessions in one burst from holding one `pi` process per session. Sessions with an
+   * in-flight request are never released.
+   */
+  trimResidentSessions(): string[] {
+    if (this.sessions.size <= this.maxResident) return []
+
+    const keep = new Set<string>()
+    for (const id of this.recentlyUsed.slice(-this.maxResident)) {
+      for (const lineageId of this.sessionLineageIds(id)) keep.add(lineageId)
+    }
+
+    const released: string[] = []
+    for (const [id, session] of [...this.sessions]) {
+      if (this.sessions.size <= this.maxResident) break
+      if (keep.has(id)) continue
+      if (this.isInFlight(id)) continue
+      if (this.activeSubagentRuns.get(id)?.size) continue
+      if (!session.isIdle()) continue
+      if (this.releaseIdleSession(id)) released.push(id)
+    }
+
+    return released
+  }
+
+  /**
+   * Free a session's pi process once nothing is using it. A viewer opened for a finished
+   * task otherwise stays resident for as long as the client keeps that thread open, which is
+   * what leaves a second `pi` process alongside the parent's.
+   *
+   * Explicit releases ignore leases: the caller (a finished task handing back a child thread,
+   * or a load releasing a finished viewer) has decided the process is no longer needed. Only
+   * the cap refuses to touch a session with an in-flight request.
+   */
+  releaseIdleSession(sessionId: string): boolean {
+    if (this.activeSubagentRuns.get(sessionId)?.size) return false
+    const session = this.sessions.get(sessionId)
+    if (!session || !session.isIdle()) return false
+
+    try {
+      session.proc.dispose?.()
+    } catch {
+      // ignore
+    }
+    this.sessions.delete(sessionId)
+    this.forgetRecentlyUsed(sessionId)
+    return true
+  }
+
+  private rememberRecentlyUsed(sessionId: string): void {
+    this.forgetRecentlyUsed(sessionId)
+    this.recentlyUsed.push(sessionId)
+  }
+
+  private forgetRecentlyUsed(sessionId: string): void {
+    const index = this.recentlyUsed.indexOf(sessionId)
+    if (index >= 0) this.recentlyUsed.splice(index, 1)
+  }
+
+  /**
+   * Release the idle viewer processes reachable from `sessionId`: the session itself when it
+   * is a finished subagent thread, plus every idle descendant. The session stays resumable,
+   * so a later prompt or config change restores a fresh process.
+   */
+  releaseIdleSubagentSessions(sessionId: string): string[] {
+    const released: string[] = []
+    if (this.isSubagentSession(sessionId) && this.releaseIdleSession(sessionId)) {
+      released.push(sessionId)
+    }
+    for (const childId of this.subagentChildIds(sessionId)) {
+      if (this.releaseIdleSession(childId)) released.push(childId)
+    }
+    return released
+  }
+
+  /**
+   * Reject any write to a child session that a running parent task still owns: two pi
+   * processes appending to the same session file would fork the transcript. Covers every
+   * mutator (prompt, model, thinking level, config option, delete), not just prompts.
+   */
+  assertSessionMutable(sessionId: string): void {
+    if (!this.activeSubagentRuns.get(sessionId)?.size) return
+    throw RequestError.invalidParams(
+      { sessionId },
+      `Session ${sessionId} is read-only while its parent task is running. Wait for the task to finish.`
+    )
+  }
+
+  /**
+   * A dead pi process can never emit the task completion that would release its child
+   * sessions, so clear their active runs here. Without this a child stays read-only until
+   * the parent thread is closed or the agent restarts.
+   */
+  private releaseDescendantsOf(sessionId: string): void {
+    for (const childId of this.subagentChildIds(sessionId)) {
+      if (this.activeSubagentRuns.delete(childId)) this.releaseOrMarkStale(childId)
+    }
+  }
+
+  /**
+   * Drop a child process opened during a finished task so the next write starts fresh from
+   * the completed session file. Returns whether a live process was actually released.
+   *
+   * The stale mark survives when nothing is registered yet: a restore that straddles the
+   * task completion registers a process opened before those writes, and the caller's
+   * post-restore check must still be able to recycle it.
+   */
+  recycleStaleSubagentSession(sessionId: string): boolean {
+    if (!this.staleSubagentSessions.delete(sessionId)) return false
+    const session = this.sessions.get(sessionId)
+    if (!session) return false
+
+    try {
+      session.proc.dispose?.()
+    } catch {
+      // ignore
+    }
+    this.sessions.delete(sessionId)
+    return true
+  }
+
+  subagentChildIds(parentSessionId: string): string[] {
+    const children: string[] = []
+    const seen = new Set([parentSessionId])
+    const queue = [parentSessionId]
+    while (queue.length > 0) {
+      const current = queue.shift() as string
+      for (const [childId, parentId] of this.subagentParents) {
+        if (parentId !== current || seen.has(childId)) continue
+        seen.add(childId)
+        children.push(childId)
+        queue.push(childId)
+      }
+    }
+    return children
+  }
+
+  forgetSubagentSession(sessionId: string): void {
+    for (const [childId, parentId] of this.subagentParents) {
+      if (childId === sessionId || parentId === sessionId) this.subagentParents.delete(childId)
+    }
+    this.activeSubagentRuns.delete(sessionId)
+    this.staleSubagentSessions.delete(sessionId)
+  }
+
+  sessionLineageIds(sessionId: string): Set<string> {
+    const lineage = new Set<string>()
+    let current: string | undefined = sessionId
+    while (current && !lineage.has(current)) {
+      lineage.add(current)
+      current = this.subagentParents.get(current)
+    }
+    return lineage
   }
 
   /** Get a registered session if it exists (no throw). */
@@ -204,6 +478,8 @@ export class SessionManager {
    * Used when clients explicitly reload a session and we want a fresh pi subprocess.
    */
   close(sessionId: string): void {
+    this.releaseDescendantsOf(sessionId)
+
     const s = this.sessions.get(sessionId)
     if (!s) return
     try {
@@ -212,12 +488,14 @@ export class SessionManager {
       // ignore
     }
     this.sessions.delete(sessionId)
+    this.forgetRecentlyUsed(sessionId)
   }
 
-  /** Close all sessions except the one with `keepSessionId`. */
-  closeAllExcept(keepSessionId: string): void {
+  /** Close all sessions except the requested ids (or their linked parent chains). */
+  closeAllExcept(keepSessionIds: string | Iterable<string>): void {
+    const keep = typeof keepSessionIds === 'string' ? new Set([keepSessionIds]) : new Set(keepSessionIds)
     for (const [id] of this.sessions) {
-      if (id === keepSessionId) continue
+      if (keep.has(id) || this.isInFlight(id)) continue
       this.close(id)
     }
   }
@@ -258,10 +536,15 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      onSubagentSession: childSessionId => this.registerSubagentSession(sessionId, childSessionId),
+      onSubagentTaskActive: (childSessionId, taskRunKey) => this.markSubagentSessionActive(childSessionId, taskRunKey),
+      onSubagentTaskCompleted: (childSessionId, taskRunKey) =>
+        this.markSubagentSessionCompleted(childSessionId, taskRunKey)
     })
 
     this.sessions.set(sessionId, session)
+    proc.onExit?.(() => this.releaseDescendantsOf(sessionId))
     return session
   }
 
@@ -285,10 +568,15 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      onSubagentSession: childSessionId => this.registerSubagentSession(sessionId, childSessionId),
+      onSubagentTaskActive: (childSessionId, taskRunKey) => this.markSubagentSessionActive(childSessionId, taskRunKey),
+      onSubagentTaskCompleted: (childSessionId, taskRunKey) =>
+        this.markSubagentSessionCompleted(childSessionId, taskRunKey)
     })
 
     this.sessions.set(sessionId, session)
+    params.proc.onExit?.(() => this.releaseDescendantsOf(sessionId))
     return session
   }
 }
@@ -317,6 +605,14 @@ export class PiAcpSession {
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
   private streamedToolCalls = new Map<number, { id: string; name: string; partialArgs: string }>()
+  private readonly onSubagentSession?: (sessionId: string) => void
+  private readonly onSubagentTaskActive?: (childSessionId: string, taskRunKey: string) => void
+  private readonly onSubagentTaskCompleted?: (childSessionId: string, taskRunKey: string) => void
+  private readonly taskToolCalls = new Map<string, { toolCallId: string; status: 'completed' | 'failed' }>()
+  private readonly taskSessionIds = new Map<string, string>()
+  private readonly taskChildSessionIds = new Map<string, string>()
+  private readonly completedTaskIds = new Set<string>()
+  private readonly linkedTaskCalls = new Set<string>()
 
   // pi can emit multiple `turn_end` and `agent_end` events for a single user prompt
   // when retry, compaction, or queued continuations run. The session-level prompt
@@ -342,6 +638,9 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    onSubagentSession?: (sessionId: string) => void
+    onSubagentTaskActive?: (childSessionId: string, taskRunKey: string) => void
+    onSubagentTaskCompleted?: (childSessionId: string, taskRunKey: string) => void
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -349,6 +648,9 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+    this.onSubagentSession = opts.onSubagentSession
+    this.onSubagentTaskActive = opts.onSubagentTaskActive
+    this.onSubagentTaskCompleted = opts.onSubagentTaskCompleted
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -356,6 +658,11 @@ export class PiAcpSession {
   setStartupInfo(text: string) {
     this.startupInfo = text
     this.startupInfoSent = false
+  }
+
+  /** True when no turn is running or queued, so the process can be released and restored. */
+  isIdle(): boolean {
+    return this.pendingTurn === null
   }
 
   /**
@@ -523,6 +830,116 @@ export class PiAcpSession {
     })
   }
 
+  rememberSubagentSession(sessionId: string): void {
+    if (sessionId.trim()) this.onSubagentSession?.(sessionId)
+  }
+
+  private findTaskRunKey(taskId: string, piToolCallId?: string): string {
+    if (piToolCallId) return taskLinkKey(taskId, piToolCallId)
+
+    const prefix = `${taskId}\u0000`
+    const candidates = new Set<string>()
+    for (const key of [
+      ...this.taskToolCalls.keys(),
+      ...this.taskSessionIds.keys(),
+      ...this.taskChildSessionIds.keys(),
+      ...this.completedTaskIds,
+      ...this.linkedTaskCalls
+    ]) {
+      if (key.startsWith(prefix)) candidates.add(key)
+    }
+    return candidates.size === 1 ? [...candidates][0]! : taskId
+  }
+
+  private linkTaskSession(taskId: string, sessionId: string, piToolCallId?: string, liveLink = false): string {
+    const key = this.findTaskRunKey(taskId, piToolCallId)
+    this.rememberSubagentSession(sessionId)
+    this.taskChildSessionIds.set(key, sessionId)
+    if (liveLink && !this.completedTaskIds.has(key)) this.onSubagentTaskActive?.(sessionId, key)
+    if (this.linkedTaskCalls.has(key)) return key
+
+    if (piToolCallId && this.currentToolCalls.has(piToolCallId)) {
+      this.emit({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: piToolCallId,
+        status: this.currentToolCalls.get(piToolCallId),
+        _meta: subagentSessionInfoMeta(sessionId)
+      })
+      this.taskToolCalls.delete(key)
+      this.taskSessionIds.delete(key)
+      this.linkedTaskCalls.add(key)
+      return key
+    }
+
+    const toolCall = this.taskToolCalls.get(key)
+    if (!toolCall) {
+      this.taskSessionIds.set(key, sessionId)
+      return key
+    }
+
+    this.emit({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: toolCall.toolCallId,
+      status: toolCall.status,
+      _meta: subagentSessionInfoMeta(sessionId)
+    })
+    this.taskToolCalls.delete(key)
+    this.taskSessionIds.delete(key)
+    this.linkedTaskCalls.add(key)
+    return key
+  }
+
+  private handleTaskToolResult(
+    taskId: string,
+    toolCallId: string,
+    status: 'completed' | 'failed',
+    sessionId: string | undefined,
+    background: boolean
+  ): LinkedTaskResult | undefined {
+    const exactKey = taskLinkKey(taskId, toolCallId)
+    const legacyKey = this.taskSessionIds.has(taskId) || this.taskChildSessionIds.has(taskId) ? taskId : exactKey
+    const taskRunKey =
+      this.taskSessionIds.has(exactKey) || this.taskChildSessionIds.has(exactKey) ? exactKey : legacyKey
+    const knownSessionId = this.taskSessionIds.get(taskRunKey) ?? this.taskChildSessionIds.get(taskRunKey)
+    const childSessionId = sessionId ?? knownSessionId
+
+    if (childSessionId) {
+      if (knownSessionId !== childSessionId) this.rememberSubagentSession(childSessionId)
+      this.taskChildSessionIds.set(taskRunKey, childSessionId)
+      this.taskToolCalls.delete(taskRunKey)
+      this.taskSessionIds.delete(taskRunKey)
+      this.linkedTaskCalls.add(taskRunKey)
+      if (!background) this.completedTaskIds.add(taskRunKey)
+      return { childSessionId, taskRunKey }
+    }
+
+    if (!background) this.completedTaskIds.add(taskRunKey)
+    this.taskToolCalls.set(taskRunKey, { toolCallId, status })
+    return undefined
+  }
+
+  private handlePiTaskSessionEvent(
+    event: NonNullable<ReturnType<typeof readPiTaskSessionEvent>>,
+    liveLink = false
+  ): void {
+    if (event.kind === 'task-session' && event.sessionId) {
+      this.linkTaskSession(event.taskId, event.sessionId, event.piToolCallId, liveLink)
+      return
+    }
+
+    const taskRunKey = this.findTaskRunKey(event.taskId, event.piToolCallId)
+    if (event.sessionId && !this.taskChildSessionIds.has(taskRunKey)) {
+      this.linkTaskSession(event.taskId, event.sessionId, event.piToolCallId)
+    }
+    if (event.kind !== 'task-complete') return
+
+    this.completedTaskIds.add(taskRunKey)
+    const childSessionId = event.sessionId ?? this.taskChildSessionIds.get(taskRunKey)
+    if (childSessionId) this.onSubagentTaskCompleted?.(childSessionId, taskRunKey)
+    this.taskToolCalls.delete(taskRunKey)
+    this.taskSessionIds.delete(taskRunKey)
+  }
+
   private emitBashOutputUpdate(params: {
     toolCallId: string
     status: 'in_progress' | 'completed' | 'failed'
@@ -601,6 +1018,26 @@ export class PiAcpSession {
     const type = String((ev as any).type ?? '')
 
     switch (type) {
+      case 'entry_appended': {
+        const taskEntry = readPiTaskSessionEvent(ev.entry)
+        if (taskEntry) this.handlePiTaskSessionEvent(taskEntry, taskEntry.kind === 'task-session')
+        break
+      }
+
+      case 'message_end': {
+        const taskEvent = readPiTaskSessionEvent(ev.message)
+        if (taskEvent) this.handlePiTaskSessionEvent(taskEvent)
+
+        const visibleText = readVisibleCustomMessageText(ev.message)
+        if (!visibleText) break
+
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: visibleText } satisfies ContentBlock
+        })
+        break
+      }
+
       case 'message_update': {
         const event = asRecord(ev.assistantMessageEvent)
         if (!event) break
@@ -817,6 +1254,20 @@ export class PiAcpSession {
           break
         }
 
+        const taskResult = readPiTaskToolResult(result)
+        const taskLink = taskResult
+          ? this.handleTaskToolResult(
+              taskResult.taskId,
+              toolCallId,
+              isError ? 'failed' : 'completed',
+              taskResult.sessionId,
+              taskResult.background
+            )
+          : undefined
+        const subagentSessionId = taskLink?.childSessionId
+        if (taskLink && taskResult && !taskResult.background) {
+          this.onSubagentTaskCompleted?.(taskLink.childSessionId, taskLink.taskRunKey)
+        }
         const text = toolResultToText(result)
 
         const snapshot = this.fileSnapshots.get(toolCallId)
@@ -852,7 +1303,8 @@ export class PiAcpSession {
           toolCallId,
           status: isError ? 'failed' : 'completed',
           content,
-          ...(hasStructuredDiff ? {} : { rawOutput: result })
+          ...(hasStructuredDiff ? {} : { rawOutput: result }),
+          ...(subagentSessionId ? { _meta: subagentSessionInfoMeta(subagentSessionId) } : {})
         })
 
         this.cleanupToolCall(toolCallId)

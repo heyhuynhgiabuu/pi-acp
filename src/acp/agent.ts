@@ -20,12 +20,21 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
   type StopReason,
+  type CloseSessionRequest,
+  type CloseSessionResponse,
   type DeleteSessionRequest,
   type DeleteSessionResponse
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
-import { SessionManager, type PiAcpSession } from './session.js'
+import { SessionManager, readVisibleCustomMessageText, type PiAcpSession } from './session.js'
+import {
+  readPiTaskSessionEvent,
+  readPiTaskSessionEventsFromSessionFile,
+  readPiTaskToolResult,
+  subagentSessionInfoMeta
+} from './subagent-session.js'
 import { SessionStore } from './session-store.js'
+import { SpawnLimiter, maxConcurrentSpawns } from './spawn-limiter.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { findPiChangelogPath, getPiCommandVersion } from '../pi-rpc/command.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
@@ -125,6 +134,8 @@ export class PiAcpAgent implements ACPAgent {
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
+  // Threads restored in parallel must not each start a pi process before any can be closed.
+  private readonly spawnLimiter = new SpawnLimiter(maxConcurrentSpawns())
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -136,6 +147,51 @@ export class PiAcpAgent implements ACPAgent {
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
     void _config
+  }
+
+  /**
+   * Run a client request while holding a lease on its session. The manager refuses to evict or
+   * close a leased session, so a concurrent request for another thread cannot take this
+   * request's pi process away mid-RPC.
+   */
+  private async withSessionLease<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
+    const release = (this.sessions as any).beginRequest?.(sessionId)
+    try {
+      return await request()
+    } finally {
+      release?.()
+      // The request is done with its session, so the cap can now be enforced for real: during
+      // the request the session was skipped, and nothing else may have trimmed since.
+      ;(this.sessions as any).trimResidentSessions?.()
+    }
+  }
+
+  /**
+   * Guard every write to a child session: reject while a running task owns the transcript,
+   * and drop a process opened before the task finished so the write cannot fork the session
+   * tree onto a stale branch. Tolerates a stubbed manager (tests replace `this.sessions`).
+   */
+  private prepareChildSession(sessionId: string): void {
+    const sessions = this.sessions as any
+    sessions.assertSessionMutable?.(sessionId)
+    sessions.recycleStaleSubagentSession?.(sessionId)
+  }
+
+  /**
+   * Restore a session for writing. A restore already in flight when the task completed
+   * would otherwise be adopted as-is, so the stale check is repeated once it lands.
+   */
+  private async openSessionForWrite(sessionId: string): Promise<PiAcpSession> {
+    this.prepareChildSession(sessionId)
+
+    let session = await this.restoreSession(sessionId)
+    if ((this.sessions as any).recycleStaleSubagentSession?.(sessionId)) {
+      session = await this.restoreSession(sessionId)
+    }
+
+    // The client is working with this session, so it outranks older idle ones under the cap.
+    ;(this.sessions as any).touch?.(sessionId)
+    return session
   }
 
   private cleanupFailedNewSession(sessionId: string, state?: any | null): void {
@@ -159,6 +215,9 @@ export class PiAcpAgent implements ACPAgent {
 
   private findStoredSession(sessionId: string): { cwd: string; sessionFile: string } | null {
     const stored = this.store.get(sessionId)
+    // The store is authoritative on a hit: the discovery fallback below walks every pi
+    // session file, which is far too slow to run for a stale mapping. Stale entries are
+    // pruned from the map itself instead.
     if (stored?.cwd && stored?.sessionFile) {
       return { cwd: stored.cwd, sessionFile: stored.sessionFile }
     }
@@ -198,11 +257,13 @@ export class PiAcpAgent implements ACPAgent {
 
       let proc: PiRpcProcess
       try {
-        proc = await PiRpcProcess.spawn({
-          cwd,
-          sessionPath: stored.sessionFile,
-          piCommand: process.env.PI_ACP_PI_COMMAND
-        })
+        proc = await this.spawnLimiter.run(() =>
+          PiRpcProcess.spawn({
+            cwd,
+            sessionPath: stored.sessionFile,
+            piCommand: process.env.PI_ACP_PI_COMMAND
+          })
+        )
       } catch (e: any) {
         if (e?.name === 'PiRpcSpawnError') {
           throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
@@ -210,14 +271,26 @@ export class PiAcpAgent implements ACPAgent {
         throw e
       }
 
-      const fileCommands = loadSlashCommands(cwd)
-      const session = this.sessions.getOrCreate(sessionId, {
-        cwd,
-        mcpServers: opts?.mcpServers ?? [],
-        conn: this.conn,
-        proc,
-        fileCommands
-      })
+      // The process is not yet owned by the manager, so a failure before registration
+      // would leave an orphaned pi subprocess behind.
+      let session: PiAcpSession
+      try {
+        const fileCommands = loadSlashCommands(cwd)
+        session = this.sessions.getOrCreate(sessionId, {
+          cwd,
+          mcpServers: opts?.mcpServers ?? [],
+          conn: this.conn,
+          proc,
+          fileCommands
+        })
+      } catch (error) {
+        try {
+          proc.dispose?.()
+        } catch {
+          // ignore: the original failure is the primary result
+        }
+        throw error
+      }
 
       this.lastSessionCwd = cwd
       this.store.upsert({ sessionId, cwd, sessionFile: stored.sessionFile })
@@ -263,7 +336,10 @@ export class PiAcpAgent implements ACPAgent {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
           list: {},
-          delete: {}
+          delete: {},
+          // Without this, a client that closes a thread never tells us, so its pi
+          // subprocess lingers until the next session/new or session/load.
+          close: {}
         }
       }
     }
@@ -280,14 +356,30 @@ export class PiAcpAgent implements ACPAgent {
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
     // Pi doesn't support mcpServers, but we accept and store.
-    const session = await this.sessions.create({
-      cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      conn: this.conn,
-      fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
-    })
+    const session = await this.spawnLimiter.run(() =>
+      this.sessions.create({
+        cwd: params.cwd,
+        mcpServers: params.mcpServers,
+        conn: this.conn,
+        fileCommands,
+        piCommand: process.env.PI_ACP_PI_COMMAND
+      })
+    )
+    ;(this.sessions as any).touch?.(session.sessionId)
 
+    // Hold the fresh session for the rest of the request: the state, model and config RPCs
+    // below would fail if a concurrent request for another thread evicted this process.
+    return this.withSessionLease(session.sessionId, () =>
+      this.finishNewSession(session, params.cwd, fileCommands, enableSkillCommands)
+    )
+  }
+
+  private async finishNewSession(
+    session: PiAcpSession,
+    cwd: string,
+    fileCommands: ReturnType<typeof loadSlashCommands>,
+    enableSkillCommands: boolean
+  ) {
     // Fetch state + models once (parallel) to reduce startup latency.
     let state: any = null
     let availableModels: any = null
@@ -359,7 +451,7 @@ export class PiAcpAgent implements ACPAgent {
     const { configOptions, models, modes } = sessionConfiguration
 
     const piVersion = getPiCommandVersion()
-    const quietStartup = getQuietStartup(params.cwd)
+    const quietStartup = getQuietStartup(cwd)
     const updateNotice = buildUpdateNotice(piVersion)
 
     // If quietStartup is enabled, suppress the full "startup info" prelude, but still surface
@@ -369,20 +461,19 @@ export class PiAcpAgent implements ACPAgent {
         ? updateNotice + '\n'
         : ''
       : buildStartupInfo({
-          cwd: params.cwd,
+          cwd,
           fileCommands,
           piVersion,
           updateNotice
         })
 
-    if (preludeText)
-      session.setStartupInfo(preludeText)
+    if (preludeText) session.setStartupInfo(preludeText)
 
-      // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
-      // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
-      // It does NOT affect other client windows because they run in separate agent processes.
-      //
-      // (Tests sometimes stub out `this.sessions`, so guard the call.)
+    // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
+    // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
+    // It does NOT affect other client windows because they run in separate agent processes.
+    //
+    // (Tests sometimes stub out `this.sessions`, so guard the call.)
     ;(this.sessions as any).closeAllExcept?.(session.sessionId)
 
     const response = {
@@ -449,7 +540,14 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const session = await this.restoreSession(params.sessionId)
+    // Hold the session for the whole request, including the slash-command branches that run
+    // RPCs before any turn starts.
+    return this.withSessionLease(params.sessionId, () => this.promptInternal(params))
+  }
+
+  private async promptInternal(params: PromptRequest): Promise<PromptResponse> {
+    // Tests may replace the session manager with a minimal stub.
+    const session = await this.openSessionForWrite(params.sessionId)
 
     const { message, images } = promptToPiMessage(params.prompt)
 
@@ -871,9 +969,11 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    const session = this.sessions.maybeGet(params.sessionId)
-    if (!session) return
-    await session.cancel()
+    return this.withSessionLease(params.sessionId, async () => {
+      const session = this.sessions.maybeGet(params.sessionId)
+      if (!session) return
+      await session.cancel()
+    })
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -906,6 +1006,10 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    return this.withSessionLease(params.sessionId, () => this.loadSessionInternal(params))
+  }
+
+  private async loadSessionInternal(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     if (!isAbsolute(params.cwd)) {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
@@ -923,16 +1027,20 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+
+    // Close the previous threads' processes before starting another one. The policy below
+    // only runs at the end of a load, so staggered restores (a client restoring several
+    // threads over a few seconds) would otherwise keep every finished load resident until
+    // the next one completes.
+    this.sessions.closeAllExcept(this.sessions.sessionLineageIds(params.sessionId))
+
     const session = await this.restoreSession(params.sessionId, {
       cwd: params.cwd,
       mcpServers: params.mcpServers
     })
+    ;(this.sessions as any).touch?.(session.sessionId)
     const proc = session.proc
     const fileCommands = loadSlashCommands(params.cwd)
-
-    // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
-    // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
 
     // (Optional) ensure mapping stays fresh.
     this.store.upsert({
@@ -944,9 +1052,114 @@ export class PiAcpAgent implements ACPAgent {
     // Replay full conversation history.
     const data = (await proc.getMessages()) as any
     const messages = Array.isArray(data?.messages) ? data.messages : []
+    const taskToolCalls = new Map<string, { toolCallId: string; status: 'completed' | 'failed' }>()
+    const taskSessionIds = new Map<string, string>()
+    const completedTaskRuns = new Set<string>()
+    const linkedTaskCalls = new Set<string>()
+    const taskLinkKey = (taskId: string, piToolCallId?: string): string =>
+      piToolCallId ? `${taskId}\u0000${piToolCallId}` : taskId
+    const taskCallIdsByTask = new Map<string, Set<string>>()
+    const toolResultIds = new Set<string>()
+
+    for (const message of messages) {
+      const toolCallId = typeof (message as any)?.toolCallId === 'string' ? (message as any).toolCallId : undefined
+      if (toolCallId) toolResultIds.add(toolCallId)
+
+      const taskResult = readPiTaskToolResult(message)
+      if (!taskResult || !toolCallId) continue
+      const callIds = taskCallIdsByTask.get(taskResult.taskId) ?? new Set<string>()
+      callIds.add(toolCallId)
+      taskCallIdsByTask.set(taskResult.taskId, callIds)
+    }
+
+    // Anchors a durable link may attach to: persisted tool results plus assistant tool calls
+    // that have not produced a result yet (a task still running when the session reloaded).
+    const assistantToolCallIds = new Set<string>()
+    for (const message of messages) {
+      if (String((message as any)?.role ?? '') !== 'assistant') continue
+      const content = (message as any)?.content
+      if (!Array.isArray(content)) continue
+
+      for (const part of content) {
+        const call = part as { type?: unknown; id?: unknown }
+        if (call?.type !== 'toolCall' || typeof call.id !== 'string' || !call.id) continue
+        assistantToolCallIds.add(call.id)
+      }
+    }
+
+    const projectedToolCallIds = new Set([...toolResultIds, ...assistantToolCallIds])
+    const childSessionIdByToolCallId = new Map<string, string>()
+
+    const resolveTaskRunKey = (taskId: string, piToolCallId?: string): string => {
+      if (piToolCallId) return taskLinkKey(taskId, piToolCallId)
+      const prefix = `${taskId}\u0000`
+      const candidates = new Set<string>()
+      for (const key of [...taskToolCalls.keys(), ...taskSessionIds.keys(), ...completedTaskRuns, ...linkedTaskCalls]) {
+        if (key.startsWith(prefix)) candidates.add(key)
+      }
+      return candidates.size === 1 ? [...candidates][0]! : taskId
+    }
+
+    const linkTaskSession = async (taskId: string, sessionId: string, piToolCallId?: string) => {
+      session.rememberSubagentSession(sessionId)
+      const key = resolveTaskRunKey(taskId, piToolCallId)
+      if (piToolCallId) childSessionIdByToolCallId.set(piToolCallId, sessionId)
+      if (linkedTaskCalls.has(key)) return
+      const toolCall = taskToolCalls.get(key)
+      if (!toolCall) {
+        taskSessionIds.set(key, sessionId)
+        return
+      }
+      taskToolCalls.delete(key)
+      taskSessionIds.delete(key)
+      linkedTaskCalls.add(key)
+      await this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: toolCall.toolCallId,
+          status: toolCall.status,
+          _meta: subagentSessionInfoMeta(sessionId)
+        }
+      })
+    }
+
+    const replayTaskEvent = async (taskEvent: NonNullable<ReturnType<typeof readPiTaskSessionEvent>>) => {
+      const callIds = taskCallIdsByTask.get(taskEvent.taskId)
+      const piToolCallId = taskEvent.piToolCallId ?? (callIds?.size === 1 ? [...callIds][0] : undefined)
+      if (taskEvent.sessionId) await linkTaskSession(taskEvent.taskId, taskEvent.sessionId, piToolCallId)
+      if (taskEvent.kind !== 'task-complete') return
+      const key = resolveTaskRunKey(taskEvent.taskId, piToolCallId)
+      completedTaskRuns.add(key)
+      if (!linkedTaskCalls.has(key) && !taskSessionIds.has(key)) taskToolCalls.delete(key)
+    }
+
+    for (const taskEvent of await readPiTaskSessionEventsFromSessionFile(stored.sessionFile)) {
+      if (taskEvent.kind !== 'task-session' || !taskEvent.sessionId) continue
+      const callIds = taskCallIdsByTask.get(taskEvent.taskId)
+      const piToolCallId = taskEvent.piToolCallId ?? (callIds?.size === 1 ? [...callIds][0] : undefined)
+      if (!piToolCallId || !projectedToolCallIds.has(piToolCallId)) continue
+      await linkTaskSession(taskEvent.taskId, taskEvent.sessionId, piToolCallId)
+    }
 
     for (const m of messages) {
       const role = String(m?.role ?? '')
+
+      if (role === 'custom') {
+        const taskEvent = readPiTaskSessionEvent(m)
+        if (taskEvent) await replayTaskEvent(taskEvent)
+        const visibleText = readVisibleCustomMessageText(m)
+        if (visibleText) {
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: visibleText }
+            }
+          })
+        }
+        continue
+      }
 
       if (role === 'user') {
         const text = normalizePiMessageText(m?.content)
@@ -972,6 +1185,36 @@ export class PiAcpAgent implements ACPAgent {
             }
           })
         }
+
+        // A task still running when the session reloaded has no persisted tool result, so
+        // its assistant tool call is the only anchor for the child link. Replay it as a
+        // tool call and attach the child session, or the child card would never appear.
+        const content = (m as any)?.content
+        if (!Array.isArray(content)) continue
+
+        for (const part of content) {
+          const call = part as { type?: unknown; id?: unknown; name?: unknown; arguments?: unknown }
+          if (call?.type !== 'toolCall' || typeof call.id !== 'string' || !call.id) continue
+          if (toolResultIds.has(call.id)) continue
+
+          const childSessionId = childSessionIdByToolCallId.get(call.id)
+          if (!childSessionId) continue
+          childSessionIdByToolCallId.delete(call.id)
+
+          const toolName = typeof call.name === 'string' ? call.name : 'tool'
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: call.id,
+              title: toolName,
+              kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
+              status: 'in_progress',
+              rawInput: call.arguments ?? null,
+              _meta: subagentSessionInfoMeta(childSessionId)
+            }
+          })
+        }
       }
 
       if (role === 'toolResult') {
@@ -979,6 +1222,23 @@ export class PiAcpAgent implements ACPAgent {
         const toolCallId = String((m as any)?.toolCallId ?? crypto.randomUUID())
         const isError = Boolean((m as any)?.isError)
         const isBash = isBashTool(toolName)
+        const taskResult = readPiTaskToolResult(m)
+        const taskRunKey = taskResult ? resolveTaskRunKey(taskResult.taskId, toolCallId) : undefined
+        const pendingTaskSession = taskResult
+          ? (taskSessionIds.get(taskRunKey!) ?? taskSessionIds.get(taskResult.taskId))
+          : undefined
+        const subagentSessionId = taskResult ? (taskResult.sessionId ?? pendingTaskSession) : undefined
+
+        if (taskResult && taskRunKey && subagentSessionId) {
+          session.rememberSubagentSession(subagentSessionId)
+          taskToolCalls.delete(taskRunKey)
+          taskSessionIds.delete(taskRunKey)
+          linkedTaskCalls.add(taskRunKey)
+          if (!taskResult.background) completedTaskRuns.add(taskRunKey)
+        } else if (taskResult && taskRunKey) {
+          taskToolCalls.set(taskRunKey, { toolCallId, status: isError ? 'failed' : 'completed' })
+          if (!taskResult.background) completedTaskRuns.add(taskRunKey)
+        }
 
         if (isBash) {
           const text = bashResultText(m)
@@ -1032,11 +1292,20 @@ export class PiAcpAgent implements ACPAgent {
             toolCallId,
             status: isError ? 'failed' : 'completed',
             content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
-            rawOutput: m
+            rawOutput: m,
+            ...(subagentSessionId ? { _meta: subagentSessionInfoMeta(subagentSessionId) } : {})
           }
         })
       }
     }
+
+    // A finished subagent thread does not need a resident pi process: the client already has
+    // the replayed transcript, and the next prompt or config change restores one. Keeping it
+    // alive is what leaves a second `pi` process next to the parent's.
+    this.sessions.releaseIdleSubagentSessions(session.sessionId)
+
+    const keepSessionIds = this.sessions.sessionLineageIds(session.sessionId)
+    this.sessions.closeAllExcept(keepSessionIds)
 
     const { configOptions, models, modes } = await getSessionConfiguration(proc)
 
@@ -1088,7 +1357,53 @@ export class PiAcpAgent implements ACPAgent {
     return response
   }
 
+  /**
+   * ACP `session/close`: cancel work in flight and release the session's pi subprocess.
+   * Idempotent, and the session stays resumable (unlike `deleteSession`).
+   */
+  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse | void> {
+    // A restore may still be starting the process. Closing must not race past it and
+    // leave an unowned subprocess behind.
+    const restoring = this.restoringSessions.get(params.sessionId)
+    if (restoring) {
+      try {
+        await restoring
+      } catch {
+        // The restore failed, so there is nothing to close.
+      }
+    }
+
+    const session = this.sessions.maybeGet(params.sessionId)
+    if (session) {
+      try {
+        await session.cancel()
+      } catch {
+        // Releasing the process matters more than a failed cancellation.
+      }
+    }
+
+    for (const childId of this.sessions.subagentChildIds(params.sessionId)) {
+      // A mid-turn child never settles its own `session/prompt`, so cancel before releasing.
+      const child = this.sessions.maybeGet(childId)
+      if (child) {
+        try {
+          await child.cancel()
+        } catch {
+          // Releasing the process matters more than a failed cancellation.
+        }
+      }
+      this.sessions.close(childId)
+    }
+    this.sessions.close(params.sessionId)
+
+    return {}
+  }
+
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    // A running parent task owns the child transcript; deleting it would leave the task
+    // appending to an unlinked file and strand the child session.
+    this.prepareChildSession(params.sessionId)
+
     const stored = this.store.get(params.sessionId)
     const piSession = findPiSession(params.sessionId)
 
@@ -1098,6 +1413,10 @@ export class PiAcpAgent implements ACPAgent {
     if (!stored && !piSession) {
       return {}
     }
+
+    // Close any live pi subprocess first: deleting the transcript out from under a
+    // running pi would leave it appending to an unlinked file.
+    this.sessions.close(params.sessionId)
 
     const sessionFile = stored?.sessionFile ?? piSession?.sessionFile
 
@@ -1110,44 +1429,49 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     this.store.delete(params.sessionId)
+    this.sessions.forgetSubagentSession(params.sessionId)
 
     return {}
   }
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
-    const session = await this.restoreSession(params.sessionId)
-    await setSessionModel(session.proc, params.modelId)
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
-    await session.publishContextUsage()
+    return this.withSessionLease(params.sessionId, async () => {
+      const session = await this.openSessionForWrite(params.sessionId)
+      await setSessionModel(session.proc, params.modelId)
+      await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+      await session.publishContextUsage()
+    })
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const session = await this.restoreSession(params.sessionId)
+    return this.withSessionLease(params.sessionId, async () => {
+      const session = await this.openSessionForWrite(params.sessionId)
 
-    const mode = String(params.modeId)
-    const availableLevels = await getAvailableThinkingLevels(session.proc)
-    if (!availableLevels.includes(mode)) {
-      throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
-    }
-
-    await session.proc.setThinkingLevel(mode)
-
-    // Let the client know the current mode changed (keeps the dropdown in sync).
-    void this.conn.sessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'current_mode_update',
-        currentModeId: mode
+      const mode = String(params.modeId)
+      const availableLevels = await getAvailableThinkingLevels(session.proc)
+      if (!availableLevels.includes(mode)) {
+        throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
       }
+
+      await session.proc.setThinkingLevel(mode)
+
+      // Let the client know the current mode changed (keeps the dropdown in sync).
+      void this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'current_mode_update',
+          currentModeId: mode
+        }
+      })
+
+      await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+
+      return {}
     })
-
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
-
-    return {}
   }
 
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
-    const session = await this.restoreSession(params.sessionId)
+    const session = await this.openSessionForWrite(params.sessionId)
     const configId = String(params.configId)
     let modelChanged = false
 

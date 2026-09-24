@@ -1,12 +1,21 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
 class FakeStore {
+  constructor(private readonly sessionFile: string) {}
   get(_sessionId: string) {
-    return { sessionId: 's1', cwd: '/tmp/project', sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
+    return {
+      sessionId: 's1',
+      cwd: '/tmp/project',
+      sessionFile: this.sessionFile,
+      updatedAt: new Date().toISOString()
+    }
   }
   upsert() {
     // noop
@@ -33,12 +42,16 @@ test('PiAcpAgent: does not emit startup info on loadSession', async () => {
     } as any
   }
 
+  // A stored mapping only counts when its transcript still exists on disk.
+  const sessionFile = join(mkdtempSync(join(tmpdir(), 'pi-acp-startup-info-')), 'session.jsonl')
+  writeFileSync(sessionFile, '', 'utf8')
+
   try {
     const conn = new FakeAgentSideConnection()
     const agent = new PiAcpAgent(asAgentConn(conn))
 
-    // Inject store so loadSession resolves without depending on actual filesystem.
-    ;(agent as any).store = new FakeStore()
+    // Inject store so loadSession resolves without depending on pi session discovery.
+    ;(agent as any).store = new FakeStore(sessionFile)
 
     const res = await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
 

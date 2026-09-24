@@ -30,6 +30,10 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
   const spawnCalls: any[] = []
   const storeUpserts: any[] = []
 
+  // A stored mapping only counts when its transcript still exists on disk.
+  const sessionFile = join(mkdtempSync(join(tmpdir(), 'pi-acp-store-project-')), 'session.jsonl')
+  writeFileSync(sessionFile, '', 'utf8')
+
   const sessions = new FakeSessions((sessionId, params) => ({
     sessionId,
     cwd: params.cwd,
@@ -61,7 +65,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
         return {
           sessionId,
           cwd: '/tmp/store-project',
-          sessionFile: '/tmp/store-project/session.jsonl',
+          sessionFile,
           updatedAt: new Date().toISOString()
         }
       },
@@ -79,7 +83,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
     assert.deepEqual(spawnCalls, [
       {
         cwd: '/tmp/store-project',
-        sessionPath: '/tmp/store-project/session.jsonl',
+        sessionPath: sessionFile,
         piCommand: process.env.PI_ACP_PI_COMMAND
       }
     ])
@@ -88,7 +92,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
       {
         sessionId: 'stored-session',
         cwd: '/tmp/store-project',
-        sessionFile: '/tmp/store-project/session.jsonl'
+        sessionFile
       }
     ])
   } finally {

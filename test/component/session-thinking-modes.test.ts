@@ -1,6 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
+
+// Keep the adapter's own state out of the developer's real ~/.pi/pi-acp.
+process.env.PI_ACP_HOME ??= mkdtempSync(join(tmpdir(), 'pi-acp-home-'))
 
 class FakeConn {
   updates: any[] = []

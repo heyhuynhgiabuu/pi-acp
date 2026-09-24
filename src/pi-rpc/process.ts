@@ -109,6 +109,8 @@ export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
+  private exitHandlers: Array<() => void> = []
+  private exited = false
   private readonly preludeLines: string[] = []
 
   private constructor(child: ChildProcessWithoutNullStreams) {
@@ -143,12 +145,28 @@ export class PiRpcProcess {
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      this.notifyExit()
     })
 
     child.on('error', err => {
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      this.notifyExit()
     })
+  }
+
+  private notifyExit(): void {
+    if (this.exited) return
+    this.exited = true
+    const handlers = this.exitHandlers
+    this.exitHandlers = []
+    for (const handler of handlers) {
+      try {
+        handler()
+      } catch {
+        // A cleanup handler must never mask the exit itself.
+      }
+    }
   }
 
   static async spawn(params: SpawnParams): Promise<PiRpcProcess> {
@@ -167,7 +185,7 @@ export class PiRpcProcess {
     const child = start(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env
+      env: { ...process.env, PI_ACP: '1' }
     }) as ChildProcessWithoutNullStreams
 
     // Ensure spawn failures (e.g. ENOENT when pi isn't installed) are surfaced as a
@@ -235,6 +253,27 @@ export class PiRpcProcess {
     this.eventHandlers.push(handler)
     return () => {
       this.eventHandlers = this.eventHandlers.filter(h => h !== handler)
+    }
+  }
+
+  /**
+   * Run `handler` once when the process exits or fails to spawn. A dead pi can never emit
+   * the completion that releases state it owns, so callers use this to clean up after it.
+   * A process that is already gone runs the handler immediately.
+   */
+  onExit(handler: () => void): () => void {
+    if (this.exited) {
+      try {
+        handler()
+      } catch {
+        // See notifyExit: cleanup must not throw into the caller.
+      }
+      return () => {}
+    }
+
+    this.exitHandlers.push(handler)
+    return () => {
+      this.exitHandlers = this.exitHandlers.filter(h => h !== handler)
     }
   }
 

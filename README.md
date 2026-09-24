@@ -49,6 +49,9 @@ npm install -g @earendil-works/pi-coding-agent
 
 ### Add pi-acp to your ACP client, e.g. [Zed](https://zed.dev/docs/agents/external-agents/)
 
+This fork is published as `@heyhuynhgiabuu/pi-acp`. The ACP registry entry below installs the
+upstream `pi-acp` package instead, so use the `npx`, global, or from-source option to run this fork.
+
 #### Using ACP Registry in Zed or other clients that support it:
 
 In Zed launch the registry with `zed: acp registry` command and select `pi ACP` adapter from the list. This will automatically add the agent server configuration to your `settings.json` and keep it up to date:
@@ -70,7 +73,7 @@ Add the following to your Zed `settings.json`:
     "pi": {
       "type": "custom",
       "command": "npx",
-      "args": ["-y", "pi-acp"],
+      "args": ["-y", "@heyhuynhgiabuu/pi-acp"],
       "env": {}
     }
   }
@@ -79,7 +82,7 @@ Add the following to your Zed `settings.json`:
 #### Global install
 
 ```bash
-npm install -g pi-acp
+npm install -g @heyhuynhgiabuu/pi-acp
 ```
 
 ```json
@@ -119,6 +122,8 @@ Point your ACP client to the built `dist/index.js`:
 - `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
 - Default: unset/any other value means `false`.
 - When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
+- `PI_ACP_MAX_RESIDENT_SESSIONS` caps how many `pi` session processes stay alive at once. Default `1`: the thread you are using keeps its process, and the previous one is closed, so switching threads can pay a fresh pi start (a few seconds). Raise it (for example `2` or `3`) to keep recently used threads warm at roughly one process each; invalid or non-positive values fall back to the default.
+- `PI_ACP_MAX_CONCURRENT_SPAWNS` caps how many `pi` processes boot at the same time when a client restores several threads at once. Default `2`; invalid or non-positive values fall back to the default.
 
 You can add the environment variable in the Zed settings with:
 
@@ -188,9 +193,13 @@ Your ACP client can also invoke this automatically based on the agent's advertis
 npm install
 npm run dev        # run from src via tsx
 npm run build
-npm run lint
+npm run format     # format with Oxfmt
+npm run format:check
+npm run lint       # Oxlint + anti-slop rules
 npm run test
 ```
+
+Oxlint 1.85 has no equivalent for ESLint's `no-octal` or `no-dupe-args`; `no-redeclare` and `no-undef` are enabled for `scripts/*.mjs` through an override. `unicorn/no-useless-fallback-in-spread` remains off to avoid one unrelated existing finding. The full anti-slop ruleset is intentionally enforced as errors, so `npm run lint` currently reports existing findings deferred to the planned refactor.
 
 Project layout:
 

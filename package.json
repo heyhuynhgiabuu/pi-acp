@@ -1,25 +1,26 @@
 {
-  "name": "pi-acp",
-  "version": "0.0.33",
-  "description": "ACP adapter for pi coding agent",
+  "name": "@heyhuynhgiabuu/pi-acp",
+  "version": "0.1.0",
+  "description": "ACP (Agent Client Protocol) adapter for the pi coding agent, for ACP clients such as Zed",
   "license": "MIT",
-  "author": "Sergii Kozak <svkozak@gmail.com>",
+  "author": "heyhuynhgiabuu (https://github.com/heyhuynhgiabuu)",
   "repository": {
     "type": "git",
-    "url": "https://github.com/svkozak/pi-acp.git"
+    "url": "git+https://github.com/heyhuynhgiabuu/pi-acp.git"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "bugs": {
-    "url": "https://github.com/svkozak/pi-acp/issues"
+    "url": "https://github.com/heyhuynhgiabuu/pi-acp/issues"
   },
-  "homepage": "https://github.com/svkozak/pi-acp#readme",
+  "homepage": "https://github.com/heyhuynhgiabuu/pi-acp#readme",
   "keywords": [
     "acp",
     "agent-client-protocol",
     "pi-coding-agent",
+    "zed",
+    "coding-agent",
     "adapter"
   ],
   "engines": {

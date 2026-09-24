@@ -88,10 +88,15 @@ test('PiAcpAgent: /tree lists the active branch of the session tree', async () =
     const text = h.texts().at(-1) ?? ''
     assert.match(text, /Session tree: 4 entries, 1 branch point/)
     assert.match(text, /Active branch: 3 entries/)
-    assert.match(text, /user: Fix the bug \(aaa11111\)/)
-    assert.match(text, /assistant: Starting now \(bbb22222\)/)
-    assert.match(text, /user: Also update the docs \(ccc33333\) <- current/)
-    assert.doesNotMatch(text, /Abandoned attempt/, 'only the active branch is listed')
+
+    // The digest shows where the branches are, not only the active path.
+    assert.match(text, /Branch at assistant: Starting now \(bbb22222\):/)
+    assert.match(text, /- user: Also update the docs \(ccc33333\) <- active/)
+    assert.match(text, /- user: Abandoned attempt \(ddd44444\)/)
+
+    assert.match(text, /Active branch tail:/)
+    assert.match(text, /- user: Fix the bug \(aaa11111\)/)
+    assert.match(text, /- user: Also update the docs \(ccc33333\) <- current/)
   } finally {
     h.restore()
   }
@@ -120,9 +125,10 @@ test('PiAcpAgent: /tree truncates a long branch instead of flooding the chat', a
     await h.agent.prompt({ sessionId: SESSION_ID, prompt: [{ type: 'text', text: '/tree' }] } as any)
 
     const text = h.texts().at(-1) ?? ''
-    assert.match(text, /Active branch: 40 entries \(showing the last 20\)/)
+    assert.match(text, /Session tree: 40 entries, no branches/)
+    assert.match(text, /Active branch tail \(last 8 of 40\):/)
     assert.doesNotMatch(text, /turn 0\b/)
-    assert.match(text, /turn 39/)
+    assert.match(text, /turn 39 \(entry-00\) <- current/)
   } finally {
     h.restore()
   }
@@ -183,11 +189,12 @@ test('PiAcpAgent: /tree falls back to the flat entries when pi cannot build the 
 
     const text = h.texts().at(-1) ?? ''
     assert.match(text, /Session tree: 4 entries, 1 branch point/)
-    assert.match(text, /Active branch: 3 entries/)
-    assert.match(text, /model: test\/alpha \(e0\)/)
-    assert.match(text, /user: Do the thing \(e1\)/)
-    assert.match(text, /assistant: Done \(e2\) <- current/)
-    assert.doesNotMatch(text, /Abandoned/)
+    assert.match(text, /Branch at user: Do the thing \(e1\):/)
+    assert.match(text, /- assistant: Done \(e2\) <- active/)
+    assert.match(text, /- assistant: Abandoned \(e3\)/)
+    assert.match(text, /Active branch tail:/)
+    assert.match(text, /- model: test\/alpha \(e0\)/)
+    assert.match(text, /- assistant: Done \(e2\) <- current/)
   } finally {
     h.restore()
   }

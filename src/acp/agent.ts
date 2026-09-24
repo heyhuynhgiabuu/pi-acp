@@ -118,14 +118,25 @@ function builtinAvailableCommands(): AvailableCommand[] {
       description: 'Re-print the last assistant message so the client can copy it'
     },
     {
+      name: 'clone',
+      description: 'Duplicate this thread at its current position into a new thread'
+    },
+    {
+      name: 'fork',
+      description: 'Create a new thread from an earlier user message',
+      input: { hint: '(no args to choose interactively)' }
+    },
+    {
       name: 'changelog',
       description: 'Show pi changelog'
     }
   ]
 }
 
-/** Entries shown for the active branch before the listing is truncated. */
-const TREE_BRANCH_LIMIT = 20
+/** Active-branch entries listed when nothing else stands out. */
+const TREE_TAIL_LIMIT = 8
+/** Branch points described before the listing is truncated. */
+const TREE_BRANCH_LIMIT = 3
 
 type TreeEntry = {
   type?: unknown
@@ -138,7 +149,7 @@ type TreeEntry = {
   modelId?: unknown
 }
 type TreeNode = { entry?: TreeEntry; children?: TreeNode[] }
-type SessionTreeSummary = { total: number; branchPoints: number; path: TreeEntry[]; leafId: string | null }
+type NormalizedNode = { entry: TreeEntry; children: NormalizedNode[] }
 
 function treeEntryLabel(entry: TreeEntry): string {
   const type = typeof entry.type === 'string' ? entry.type : 'entry'
@@ -164,6 +175,11 @@ function treeEntryLabel(entry: TreeEntry): string {
   return type
 }
 
+function shortEntry(entry: TreeEntry): string {
+  const id = typeof entry.id === 'string' ? entry.id.slice(0, 8) : '?'
+  return `${treeEntryLabel(entry)} (${id})`
+}
+
 function messageText(content: unknown): string {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
@@ -177,103 +193,136 @@ function messageText(content: unknown): string {
 }
 
 /**
- * pi's `get_tree` recurses while building the tree and blows the stack on long sessions, so
+ * pi's `get_tree` recurses while building the tree and overflows the stack on long sessions, so
  * `get_entries` is the fallback: the same entries as a flat list plus `leafId`, which is enough to
- * count the tree and walk the active branch through `parentId` links.
+ * rebuild the tree through `parentId` links.
  */
-function summarizeTree(data: unknown): SessionTreeSummary {
-  const roots = Array.isArray((data as { tree?: unknown })?.tree) ? (data as { tree: TreeNode[] }).tree : []
+function normalizeTree(data: unknown): { roots: NormalizedNode[]; total: number; leafId: string | null } {
   const leafId = typeof (data as { leafId?: unknown })?.leafId === 'string' ? (data as { leafId: string }).leafId : null
 
+  if (Array.isArray((data as { tree?: unknown })?.tree)) {
+    const roots = ((data as { tree: TreeNode[] }).tree ?? []).map(toNormalizedNode)
+    return { roots, total: countNodes(roots), leafId }
+  }
+
+  const entries = Array.isArray((data as { entries?: unknown })?.entries)
+    ? (data as { entries: TreeEntry[] }).entries
+    : []
+
+  const nodes = new Map<string, NormalizedNode>()
+  const roots: NormalizedNode[] = []
+  for (const entry of entries) {
+    if (typeof entry.id === 'string') nodes.set(entry.id, { entry, children: [] })
+  }
+  for (const entry of entries) {
+    if (typeof entry.id !== 'string') continue
+    const node = nodes.get(entry.id)
+    if (!node) continue
+    const parent = typeof entry.parentId === 'string' ? nodes.get(entry.parentId) : undefined
+    if (parent) parent.children.push(node)
+    else roots.push(node)
+  }
+
+  return { roots, total: entries.length, leafId }
+}
+
+function toNormalizedNode(node: TreeNode): NormalizedNode {
+  return {
+    entry: node.entry ?? {},
+    children: (node.children ?? []).map(toNormalizedNode)
+  }
+}
+
+function countNodes(nodes: NormalizedNode[]): number {
   let total = 0
-  let branchPoints = 0
-  const stack = [...roots]
+  const stack = [...nodes]
   while (stack.length) {
     const node = stack.pop()
     if (!node) continue
     total += 1
-    const children = node.children ?? []
-    if (children.length > 1) branchPoints += 1
-    for (const child of children) stack.push(child)
+    for (const child of node.children) stack.push(child)
   }
-
-  return { total, branchPoints, path: findPathToLeaf(roots, leafId), leafId }
+  return total
 }
 
-function summarizeEntries(data: unknown): SessionTreeSummary {
-  const entries = Array.isArray((data as { entries?: unknown })?.entries)
-    ? (data as { entries: TreeEntry[] }).entries
-    : []
-  const leafId = typeof (data as { leafId?: unknown })?.leafId === 'string' ? (data as { leafId: string }).leafId : null
-
-  const byId = new Map<string, TreeEntry>()
-  const childCount = new Map<string, number>()
-  for (const entry of entries) {
-    if (typeof entry.id !== 'string') continue
-    byId.set(entry.id, entry)
-    const parentId = typeof entry.parentId === 'string' ? entry.parentId : null
-    if (parentId) childCount.set(parentId, (childCount.get(parentId) ?? 0) + 1)
-  }
-
-  let branchPoints = 0
-  for (const count of childCount.values()) if (count > 1) branchPoints += 1
-
-  const path: TreeEntry[] = []
-  let cursor = leafId
-  while (cursor) {
-    const entry = byId.get(cursor)
-    if (!entry) break
-    path.unshift(entry)
-    cursor = typeof entry.parentId === 'string' ? entry.parentId : null
-  }
-
-  return { total: entries.length, branchPoints, path, leafId }
-}
-
-function formatSessionTree(summary: SessionTreeSummary): string {
-  if (!summary.total) return 'Session tree is empty.'
-
-  const shown = summary.path.slice(-TREE_BRANCH_LIMIT)
-  const lines = [
-    `Session tree: ${summary.total} entr${summary.total === 1 ? 'y' : 'ies'}${summary.branchPoints ? `, ${summary.branchPoints} branch point${summary.branchPoints === 1 ? '' : 's'}` : ''}`,
-    `Active branch: ${summary.path.length} entr${summary.path.length === 1 ? 'y' : 'ies'}${summary.path.length > shown.length ? ` (showing the last ${shown.length})` : ''}`,
-    ''
-  ]
-
-  for (const entry of shown) {
-    const id = typeof entry.id === 'string' ? entry.id.slice(0, 8) : '?'
-    const marker = summary.leafId && entry.id === summary.leafId ? ' <- current' : ''
-    lines.push(`- ${treeEntryLabel(entry)} (${id})${marker}`)
-  }
-
-  return lines.join('\n')
-}
-
-function findPathToLeaf(nodes: TreeNode[], leafId: string | null): TreeEntry[] {
-  const walk = (node: TreeNode): TreeEntry[] | null => {
-    const entry = node.entry ?? {}
-    const children = node.children ?? []
-
-    if (!children.length) {
-      // A leaf ends the path only when it is the requested leaf, or when there is no leaf id.
-      if (!leafId || entry.id === leafId) return [entry]
+/** Root-to-leaf path of the active branch, and whether each node on it is the active child. */
+function activePath(roots: NormalizedNode[], leafId: string | null): NormalizedNode[] {
+  const walk = (node: NormalizedNode): NormalizedNode[] | null => {
+    if (!node.children.length) {
+      if (!leafId || node.entry.id === leafId) return [node]
       return null
     }
 
-    for (const child of children) {
+    for (const child of node.children) {
       const childPath = walk(child)
-      if (childPath) return [entry, ...childPath]
+      if (childPath) return [node, ...childPath]
     }
 
-    return [entry]
+    return leafId ? null : [node]
   }
 
-  for (const node of nodes) {
-    const path = walk(node)
+  for (const root of roots) {
+    const path = walk(root)
     if (path) return path
   }
 
   return []
+}
+
+function lastNode(node: NormalizedNode): NormalizedNode {
+  let current = node
+  while (current.children.length) {
+    // Prefer the branch that is not abandoned, so the label reads as the newest work.
+    current = current.children[current.children.length - 1]!
+  }
+  return current
+}
+
+/**
+ * Render pi's session tree for a chat client. The tree can hold thousands of entries, so this is a
+ * digest: where the branches are, what each side leads to, and the tail of the active branch.
+ */
+function formatSessionTree(data: unknown): string {
+  const { roots, total, leafId } = normalizeTree(data)
+  if (!total || !roots.length) return 'Session tree is empty.'
+
+  const path = activePath(roots, leafId)
+  const pathIds = new Set(path.map(node => (typeof node.entry.id === 'string' ? node.entry.id : '')))
+
+  const branchPoints = path.filter(node => node.children.length > 1)
+  const lines = [
+    `Session tree: ${total} entr${total === 1 ? 'y' : 'ies'}${branchPoints.length ? `, ${branchPoints.length} branch point${branchPoints.length === 1 ? '' : 's'}` : ', no branches'}`,
+    `Active branch: ${path.length} entr${path.length === 1 ? 'y' : 'ies'}`,
+    ''
+  ]
+
+  // Most recent branch points first: those are the ones a reader is looking for.
+  for (const node of branchPoints.slice(-TREE_BRANCH_LIMIT).reverse()) {
+    lines.push(`Branch at ${shortEntry(node.entry)}:`)
+
+    for (const child of node.children) {
+      const isActive = pathIds.has(typeof child.entry.id === 'string' ? child.entry.id : '')
+      const marker = isActive ? ' <- active' : ''
+      const tail = lastNode(child)
+      const tailLabel = tail.entry.id === child.entry.id ? '' : ` -> ${shortEntry(tail.entry)}`
+      lines.push(`  - ${shortEntry(child.entry)}${marker}${tailLabel}`)
+    }
+
+    lines.push('')
+  }
+
+  if (branchPoints.length > TREE_BRANCH_LIMIT) {
+    lines.push(`(${branchPoints.length - TREE_BRANCH_LIMIT} older branch point(s) not shown)`, '')
+  }
+
+  const tail = path.slice(-TREE_TAIL_LIMIT)
+  lines.push(`Active branch tail${path.length > tail.length ? ` (last ${tail.length} of ${path.length})` : ''}:`)
+  for (const node of tail) {
+    const marker = leafId && node.entry.id === leafId ? ' <- current' : ''
+    lines.push(`  - ${shortEntry(node.entry)}${marker}`)
+  }
+
+  return lines.join('\n')
 }
 
 function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
@@ -960,19 +1009,33 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (cmd === 'tree') {
-        let summary: SessionTreeSummary
+        let data: unknown
         try {
-          summary = summarizeTree(await session.proc.getTree())
+          data = await session.proc.getTree()
         } catch {
           // Long sessions overflow pi's recursive tree builder; the flat entry list still works.
-          summary = summarizeEntries(await session.proc.getEntries())
+          data = await session.proc.getEntries()
         }
 
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: formatSessionTree(summary) }
+            content: { type: 'text', text: formatSessionTree(data) }
+          }
+        })
+
+        return { stopReason: 'end_turn' }
+      }
+
+      if (cmd === 'clone' || cmd === 'fork') {
+        const text = await this.createForkedThread(session, cmd, args, this.conn)
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text }
           }
         })
 
@@ -1258,6 +1321,118 @@ export class PiAcpAgent implements ACPAgent {
    * clone rebinds the source session's process to the fork, so the process is handed back here and
    * both threads restore their own on demand.
    */
+  /**
+   * `/clone` and `/fork`: pi duplicates the active branch (or the branch at an earlier user
+   * message) into a new session and rebinds this process to it. ACP cannot move the client to
+   * another thread, so the new thread is registered in the store and the client is told to open it
+   * from its thread picker. Returns the text to show, including guidance when the command cannot
+   * proceed.
+   */
+  private async createForkedThread(
+    session: PiAcpSession,
+    mode: 'clone' | 'fork',
+    args: string[],
+    conn: AgentSideConnection
+  ): Promise<string> {
+    const proc = session.proc
+
+    if (mode === 'fork') {
+      const forkable = await this.readForkableMessages(proc)
+      if (!forkable.length) return 'No user messages to fork from.'
+
+      const selection = await this.pickForkMessage(forkable, args, conn, session.sessionId)
+      if (selection.kind === 'cancel') return 'Fork cancelled.'
+      if (selection.kind === 'invalid') return selection.message
+
+      const result = await proc.fork(selection.entryId)
+      if (result?.cancelled) return 'Fork cancelled.'
+    } else {
+      const result = await proc.clone()
+      if (result?.cancelled) return 'Clone cancelled.'
+    }
+
+    const state = (await proc.getState()) as any
+    const forkedSessionId = typeof state?.sessionId === 'string' ? state.sessionId : null
+    const forkedSessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
+
+    if (!forkedSessionId || !forkedSessionFile || forkedSessionId === session.sessionId) {
+      return 'pi did not report a new session, so nothing was created.'
+    }
+
+    this.store.upsert({ sessionId: forkedSessionId, cwd: session.cwd, sessionFile: forkedSessionFile })
+
+    // The process serves the new thread now; this thread restores its own process when used again.
+    this.sessions.close(session.sessionId)
+
+    return `${mode === 'clone' ? 'Cloned' : 'Forked'} into a new thread (${forkedSessionId}). Open it from the thread picker; this thread keeps its history.`
+  }
+
+  private async readForkableMessages(proc: PiRpcProcess): Promise<Array<{ entryId: string; text: string }>> {
+    const data = (await proc.getForkMessages()) as any
+    const messages = Array.isArray(data?.messages) ? data.messages : []
+
+    return messages
+      .map((message: { entryId?: unknown; text?: unknown }) => ({
+        entryId: typeof message?.entryId === 'string' ? message.entryId : '',
+        text: typeof message?.text === 'string' ? message.text : ''
+      }))
+      .filter((message: { entryId: string }) => message.entryId)
+  }
+
+  /**
+   * Pick a fork point from the client's picker when it supports elicitation, otherwise from the
+   * argument the user typed.
+   */
+  private async pickForkMessage(
+    forkable: Array<{ entryId: string; text: string }>,
+    args: string[],
+    conn: AgentSideConnection,
+    sessionId: string
+  ): Promise<{ kind: 'picked'; entryId: string } | { kind: 'cancel' } | { kind: 'invalid'; message: string }> {
+    const requested = args[0]?.trim()
+    if (requested) {
+      const index = Number(requested)
+      if (Number.isSafeInteger(index) && index >= 1 && index <= forkable.length) {
+        return { kind: 'picked', entryId: forkable[index - 1]!.entryId }
+      }
+
+      const byId = forkable.find(message => message.entryId.startsWith(requested))
+      if (byId) return { kind: 'picked', entryId: byId.entryId }
+
+      return { kind: 'invalid', message: `Unknown fork point: ${requested}` }
+    }
+
+    const labels = forkable.map(
+      (message, index) => `${index + 1}. ${message.text.replace(/\s+/g, ' ').trim().slice(0, 80)}`
+    )
+
+    if (!this.clientSupportsFormElicitation) {
+      return {
+        kind: 'invalid',
+        message: `This client cannot show a picker, so pass the fork point: /fork <number>\n\n${labels.join('\n')}`
+      }
+    }
+
+    const response = (await (conn as any).unstable_createElicitation({
+      sessionId,
+      mode: 'form',
+      message: 'Fork from which message?',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          choice: { type: 'string', title: 'Message', enum: labels }
+        },
+        required: ['choice']
+      }
+    })) as any
+
+    if (response?.action !== 'accept') return { kind: 'cancel' }
+
+    const choice = typeof response?.content?.choice === 'string' ? response.content.choice : ''
+    const index = labels.indexOf(choice)
+    return index >= 0 ? { kind: 'picked', entryId: forkable[index]!.entryId } : { kind: 'cancel' }
+  }
+
   async forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     return this.withSessionLease(params.sessionId, async () => {
       if (!isAbsolute(params.cwd)) {

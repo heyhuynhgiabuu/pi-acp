@@ -50,6 +50,8 @@ type PiRpcCommand =
   | { type: 'export_html'; id?: string; outputPath?: string }
   | { type: 'switch_session'; id?: string; sessionPath: string }
   | { type: 'clone'; id?: string }
+  | { type: 'fork'; id?: string; entryId: string }
+  | { type: 'get_fork_messages'; id?: string }
   // Messages
   | { type: 'get_messages'; id?: string }
   | { type: 'get_tree'; id?: string }
@@ -402,6 +404,22 @@ export class PiRpcProcess {
     const res = await this.request({ type: 'clone' })
     if (!res.success) throw new Error(`pi clone failed: ${res.error ?? JSON.stringify(res.data)}`)
     return (res.data ?? null) as { cancelled?: boolean } | null
+  }
+
+  /**
+   * Create a new session from an earlier user message. Rebinds this process like `clone`, so the
+   * caller re-reads `getState()` afterwards.
+   */
+  async fork(entryId: string): Promise<{ text?: string; cancelled?: boolean } | null> {
+    const res = await this.request({ type: 'fork', entryId })
+    if (!res.success) throw new Error(`pi fork failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return (res.data ?? null) as { text?: string; cancelled?: boolean } | null
+  }
+
+  async getForkMessages(): Promise<unknown> {
+    const res = await this.request({ type: 'get_fork_messages' })
+    if (!res.success) throw new Error(`pi get_fork_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
   }
 
   async getMessages(): Promise<unknown> {

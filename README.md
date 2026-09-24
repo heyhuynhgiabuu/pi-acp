@@ -163,11 +163,15 @@ ACP itself:
 - `/export` – export the current session to HTML in the session `cwd`
 - `/session` – show session stats (tokens/messages/cost/session file)
 - `/name <name>` – set session display name
-- `/tree` – show the session tree and the active branch (read-only; the tree can be thousands of
-  entries, so it lists the last 20 of the active branch. Long sessions fall back to pi's flat entry
-  list because `get_tree` overflows the stack there)
+- `/tree` – show where the session branches and what the active branch is (a digest, because the
+  tree can hold thousands of entries: the newest branch points with each side's tip, then the tail of
+  the active branch). Long sessions fall back to pi's flat entry list because `get_tree` overflows
+  the stack there
 - `/copy` – re-print the last assistant message so the client can select and copy it (ACP has no
   clipboard access)
+- `/clone` – duplicate this thread at its current position into a new thread
+- `/fork [number]` – create a new thread from an earlier user message; without an argument the client
+  shows a picker (clients without elicitation get the numbered list and `/fork <number>`)
 - `/changelog` – print the installed pi changelog (best-effort)
 - `/steering` – get/set pi's steering mode (pi's own queue; see below)
 - `/follow-up` – get/set pi's follow-up mode (pi's own queue; see below)

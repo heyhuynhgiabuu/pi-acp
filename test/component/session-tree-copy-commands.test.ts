@@ -199,3 +199,39 @@ test('PiAcpAgent: /tree falls back to the flat entries when pi cannot build the 
     h.restore()
   }
 })
+
+test('PiAcpAgent: /tree handles a tree thousands of nodes deep', async () => {
+  // A long session is one chain thousands of entries deep; recursive tree walks overflow there.
+  const depth = 6000
+  let node: any = {
+    entry: { type: 'message', id: 'n0', parentId: null, message: { role: 'user', content: 'turn 0' } },
+    children: []
+  }
+  const root = node
+  for (let index = 1; index < depth; index += 1) {
+    const child = {
+      entry: {
+        type: 'message',
+        id: `n${index}`,
+        parentId: `n${index - 1}`,
+        message: { role: 'user', content: `turn ${index}` }
+      },
+      children: []
+    }
+    node.children.push(child)
+    node = child
+  }
+
+  const h = harness({ getTree: async () => ({ tree: [root], leafId: `n${depth - 1}` }) })
+
+  try {
+    await h.agent.prompt({ sessionId: SESSION_ID, prompt: [{ type: 'text', text: '/tree' }] } as any)
+
+    const text = h.texts().at(-1) ?? ''
+    assert.match(text, new RegExp(`Session tree: ${depth} entries, no branches`))
+    assert.match(text, new RegExp(`Active branch tail \\(last 8 of ${depth}\\):`))
+    assert.match(text, new RegExp(`turn ${depth - 1} .* <- current`))
+  } finally {
+    h.restore()
+  }
+})

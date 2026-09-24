@@ -129,8 +129,15 @@ export class PiRpcProcess {
       try {
         msg = JSON.parse(line)
       } catch {
-        // pi may emit a human-readable prelude on stdout before NDJSON starts.
-        // Capture it so the ACP adapter can surface it on session start.
+        // A response that cannot be parsed (malformed, or nested deeper than JSON.parse can
+        // handle) must reject its request instead of hanging it until the timeout. Everything else
+        // is pi's human-readable prelude, which the adapter surfaces on session start.
+        const responseId = /"type"\s*:\s*"response"/.test(line) ? /"id"\s*:\s*"([^"]+)"/.exec(line)?.[1] : undefined
+        if (responseId !== undefined) {
+          this.pending.get(responseId)?.reject(new Error('pi sent a response that could not be parsed'))
+          return
+        }
+
         const cleaned = stripAnsi(String(line)).trimEnd()
         if (cleaned) this.preludeLines.push(cleaned)
         return

@@ -195,78 +195,105 @@ function messageText(content: unknown): string {
 /**
  * pi's `get_tree` recurses while building the tree and overflows the stack on long sessions, so
  * `get_entries` is the fallback: the same entries as a flat list plus `leafId`, which is enough to
- * rebuild the tree through `parentId` links.
+ * rebuild the tree through `parentId` links. Everything here is iterative: a long session is one
+ * chain thousands of nodes deep, which overflows any recursive walk.
+ *
+ * `parents` maps a child id to its parent node, taken from the structure itself rather than from
+ * `entry.parentId`, so it works for both pi shapes and for callers that only nest nodes.
  */
-function normalizeTree(data: unknown): { roots: NormalizedNode[]; total: number; leafId: string | null } {
+function normalizeTree(data: unknown): {
+  roots: NormalizedNode[]
+  total: number
+  leafId: string | null
+  parents: Map<string, NormalizedNode>
+  nodes: Map<string, NormalizedNode>
+} {
   const leafId = typeof (data as { leafId?: unknown })?.leafId === 'string' ? (data as { leafId: string }).leafId : null
+  const parents = new Map<string, NormalizedNode>()
+  const nodes = new Map<string, NormalizedNode>()
 
   if (Array.isArray((data as { tree?: unknown })?.tree)) {
-    const roots = ((data as { tree: TreeNode[] }).tree ?? []).map(toNormalizedNode)
-    return { roots, total: countNodes(roots), leafId }
+    const roots: NormalizedNode[] = []
+    const stack: Array<{ raw: TreeNode; parent: NormalizedNode | null }> = []
+
+    for (const raw of [...((data as { tree: TreeNode[] }).tree ?? [])].reverse()) stack.push({ raw, parent: null })
+
+    let total = 0
+    while (stack.length) {
+      const { raw, parent } = stack.pop()!
+      const node: NormalizedNode = { entry: raw.entry ?? {}, children: [] }
+      total += 1
+
+      if (parent) parent.children.push(node)
+      else roots.push(node)
+
+      const id = typeof node.entry.id === 'string' ? node.entry.id : null
+      if (id) {
+        nodes.set(id, node)
+        if (parent) parents.set(id, parent)
+      }
+
+      const children = raw.children ?? []
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        stack.push({ raw: children[index]!, parent: node })
+      }
+    }
+
+    return { roots, total, leafId, parents, nodes }
   }
 
   const entries = Array.isArray((data as { entries?: unknown })?.entries)
     ? (data as { entries: TreeEntry[] }).entries
     : []
 
-  const nodes = new Map<string, NormalizedNode>()
+  const byId = new Map<string, NormalizedNode>()
   const roots: NormalizedNode[] = []
   for (const entry of entries) {
-    if (typeof entry.id === 'string') nodes.set(entry.id, { entry, children: [] })
+    if (typeof entry.id !== 'string') continue
+    const node: NormalizedNode = { entry, children: [] }
+    byId.set(entry.id, node)
+    nodes.set(entry.id, node)
   }
   for (const entry of entries) {
     if (typeof entry.id !== 'string') continue
-    const node = nodes.get(entry.id)
+    const node = byId.get(entry.id)
     if (!node) continue
-    const parent = typeof entry.parentId === 'string' ? nodes.get(entry.parentId) : undefined
-    if (parent) parent.children.push(node)
-    else roots.push(node)
-  }
-
-  return { roots, total: entries.length, leafId }
-}
-
-function toNormalizedNode(node: TreeNode): NormalizedNode {
-  return {
-    entry: node.entry ?? {},
-    children: (node.children ?? []).map(toNormalizedNode)
-  }
-}
-
-function countNodes(nodes: NormalizedNode[]): number {
-  let total = 0
-  const stack = [...nodes]
-  while (stack.length) {
-    const node = stack.pop()
-    if (!node) continue
-    total += 1
-    for (const child of node.children) stack.push(child)
-  }
-  return total
-}
-
-/** Root-to-leaf path of the active branch, and whether each node on it is the active child. */
-function activePath(roots: NormalizedNode[], leafId: string | null): NormalizedNode[] {
-  const walk = (node: NormalizedNode): NormalizedNode[] | null => {
-    if (!node.children.length) {
-      if (!leafId || node.entry.id === leafId) return [node]
-      return null
+    const parent = typeof entry.parentId === 'string' ? byId.get(entry.parentId) : undefined
+    if (parent) {
+      parent.children.push(node)
+      parents.set(entry.id, parent)
+    } else {
+      roots.push(node)
     }
-
-    for (const child of node.children) {
-      const childPath = walk(child)
-      if (childPath) return [node, ...childPath]
-    }
-
-    return leafId ? null : [node]
   }
 
-  for (const root of roots) {
-    const path = walk(root)
-    if (path) return path
+  return { roots, total: entries.length, leafId, parents, nodes }
+}
+
+/** Root-to-leaf path of the active branch, walked through parent links so depth cannot overflow. */
+function activePath(
+  leafId: string | null,
+  parents: Map<string, NormalizedNode>,
+  nodes: Map<string, NormalizedNode>
+): NormalizedNode[] {
+  if (!leafId) return []
+
+  const leaf = nodes.get(leafId)
+  if (!leaf) return []
+
+  const path: NormalizedNode[] = []
+  const seen = new Set<string>()
+  let current: NormalizedNode | undefined = leaf
+
+  while (current) {
+    const id = typeof current.entry.id === 'string' ? current.entry.id : null
+    if (!id || seen.has(id)) break
+    seen.add(id)
+    path.unshift(current)
+    current = parents.get(id)
   }
 
-  return []
+  return path
 }
 
 function lastNode(node: NormalizedNode): NormalizedNode {
@@ -278,15 +305,11 @@ function lastNode(node: NormalizedNode): NormalizedNode {
   return current
 }
 
-/**
- * Render pi's session tree for a chat client. The tree can hold thousands of entries, so this is a
- * digest: where the branches are, what each side leads to, and the tail of the active branch.
- */
 function formatSessionTree(data: unknown): string {
-  const { roots, total, leafId } = normalizeTree(data)
-  if (!total || !roots.length) return 'Session tree is empty.'
+  const { total, leafId, parents, nodes } = normalizeTree(data)
+  if (!total || !nodes.size) return 'Session tree is empty.'
 
-  const path = activePath(roots, leafId)
+  const path = activePath(leafId, parents, nodes)
   const pathIds = new Set(path.map(node => (typeof node.entry.id === 'string' ? node.entry.id : '')))
 
   const branchPoints = path.filter(node => node.children.length > 1)
@@ -323,6 +346,17 @@ function formatSessionTree(data: unknown): string {
   }
 
   return lines.join('\n')
+}
+
+/** Counts only, for when rendering the digest itself fails. */
+function formatSessionTreeFallback(data: unknown): string {
+  const entries = Array.isArray((data as { entries?: unknown })?.entries)
+    ? (data as { entries: TreeEntry[] }).entries.length
+    : null
+  const roots = Array.isArray((data as { tree?: unknown })?.tree) ? (data as { tree: TreeNode[] }).tree.length : null
+  const size = entries ?? roots ?? 0
+
+  return `Session tree has ${size} root entr${size === 1 ? 'y' : 'ies'}; the adapter could not render the digest.`
 }
 
 function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
@@ -1017,11 +1051,18 @@ export class PiAcpAgent implements ACPAgent {
           data = await session.proc.getEntries()
         }
 
+        let text: string
+        try {
+          text = formatSessionTree(data)
+        } catch {
+          text = formatSessionTreeFallback(data)
+        }
+
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: formatSessionTree(data) }
+            content: { type: 'text', text }
           }
         })
 

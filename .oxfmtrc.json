@@ -1,0 +1,26 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "trailingComma": "none",
+  "tabWidth": 2,
+  "semi": false,
+  "bracketSpacing": true,
+  "printWidth": 120,
+  "singleQuote": true,
+  "singleAttributePerLine": true,
+  "arrowParens": "avoid",
+  "sortPackageJson": false,
+  "ignorePatterns": [
+    "node_modules/",
+    "/dist/",
+    "/.dist/",
+    "/.dist-cache/",
+    "coverage/",
+    "*.log",
+    ".DS_Store",
+    "*.map",
+    "*.tsbuildinfo",
+    "/agentDocs/",
+    "tools/oxlint/anti-slop/**",
+    "package-lock.json"
+  ]
+}

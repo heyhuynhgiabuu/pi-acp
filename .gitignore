@@ -4,9 +4,6 @@ node_modules
 dist
 *.log
 
-# ESLint cache
-.eslintcache
-
 /agentDocs
 .DS_Store
 

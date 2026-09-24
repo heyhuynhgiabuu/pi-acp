@@ -129,6 +129,10 @@ import { fileURLToPath } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
 
+// pi-acp queues prompts itself (see PiAcpSession.turnQueue) and never fills pi's steering or
+// follow-up queue, so `/steering` and `/follow-up` only affect a pi run started outside the adapter.
+const QUEUE_MODE_NOTE = " (pi's own queue; pi-acp queues prompts itself and delivers one per turn)"
+
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
@@ -687,7 +691,7 @@ export class PiAcpAgent implements ACPAgent {
               sessionUpdate: 'agent_message_chunk',
               content: {
                 type: 'text',
-                text: `Steering mode: ${current || 'unknown'}`
+                text: `Steering mode: ${current || 'unknown'}` + QUEUE_MODE_NOTE
               }
             }
           })
@@ -714,7 +718,7 @@ export class PiAcpAgent implements ACPAgent {
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: `Steering mode set to: ${modeRaw}` }
+            content: { type: 'text', text: `Steering mode set to: ${modeRaw}` + QUEUE_MODE_NOTE }
           }
         })
 
@@ -734,7 +738,7 @@ export class PiAcpAgent implements ACPAgent {
               sessionUpdate: 'agent_message_chunk',
               content: {
                 type: 'text',
-                text: `Follow-up mode: ${current || 'unknown'}`
+                text: `Follow-up mode: ${current || 'unknown'}` + QUEUE_MODE_NOTE
               }
             }
           })
@@ -761,7 +765,7 @@ export class PiAcpAgent implements ACPAgent {
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: `Follow-up mode set to: ${modeRaw}` }
+            content: { type: 'text', text: `Follow-up mode set to: ${modeRaw}` + QUEUE_MODE_NOTE }
           }
         })
 

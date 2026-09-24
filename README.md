@@ -124,6 +124,7 @@ Point your ACP client to the built `dist/index.js`:
 - When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
 - `PI_ACP_MAX_RESIDENT_SESSIONS` caps how many `pi` session processes stay alive at once. Default `1`: the thread you are using keeps its process, and the previous one is closed, so switching threads can pay a fresh pi start (a few seconds). Raise it (for example `2` or `3`) to keep recently used threads warm at roughly one process each; invalid or non-positive values fall back to the default.
 - `PI_ACP_MAX_CONCURRENT_SPAWNS` caps how many `pi` processes boot at the same time when a client restores several threads at once. Default `2`; invalid or non-positive values fall back to the default.
+- Session storage follows pi: `PI_CODING_AGENT_SESSION_DIR` overrides the `sessionDir` setting in pi's `settings.json`, which overrides `<agent dir>/sessions`. `PI_CODING_AGENT_DIR` selects the agent directory itself.
 
 You can add the environment variable in the Zed settings with:
 

@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve, isAbsolute } from 'node:path'
+import { join, resolve } from 'node:path'
 
 export type PiSessionListItem = {
   sessionId: string
@@ -29,6 +29,13 @@ function getPiAgentDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
 }
 
+function expandTilde(path: string): string {
+  const trimmed = path.trim()
+  if (trimmed === '~') return homedir()
+  if (trimmed.startsWith('~/')) return join(homedir(), trimmed.slice(2))
+  return trimmed
+}
+
 function readSessionDirFromSettings(agentDir: string): string | null {
   const settingsPath = join(agentDir, 'settings.json')
   try {
@@ -40,7 +47,9 @@ function readSessionDirFromSettings(agentDir: string): string | null {
     const sessionDir = (data as Record<string, unknown>).sessionDir
     if (typeof sessionDir !== 'string' || !sessionDir.trim()) return null
 
-    return isAbsolute(sessionDir) ? sessionDir : resolve(agentDir, sessionDir)
+    // pi resolves this value as written (expanding `~`) instead of joining it to the agent
+    // directory, so a relative value stays relative to the working directory.
+    return expandTilde(sessionDir)
   } catch {
     return null
   }
@@ -48,6 +57,12 @@ function readSessionDirFromSettings(agentDir: string): string | null {
 
 export function getPiSessionsDir(): string {
   const agentDir = getPiAgentDir()
+
+  // pi precedence: `--session-dir` (this adapter never passes it) > PI_CODING_AGENT_SESSION_DIR
+  // > settings.json `sessionDir` > `<agent dir>/sessions`.
+  const envDir = process.env.PI_CODING_AGENT_SESSION_DIR?.trim()
+  if (envDir) return expandTilde(envDir)
+
   return readSessionDirFromSettings(agentDir) ?? join(agentDir, 'sessions')
 }
 

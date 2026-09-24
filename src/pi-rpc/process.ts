@@ -53,6 +53,7 @@ type PiRpcCommand =
   // Messages
   | { type: 'get_messages'; id?: string }
   | { type: 'get_tree'; id?: string }
+  | { type: 'get_entries'; id?: string }
   | { type: 'get_last_assistant_text'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
@@ -406,6 +407,12 @@ export class PiRpcProcess {
   async getMessages(): Promise<unknown> {
     const res = await this.request({ type: 'get_messages' })
     if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async getEntries(): Promise<unknown> {
+    const res = await this.request({ type: 'get_entries' })
+    if (!res.success) throw new Error(`pi get_entries failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }
 

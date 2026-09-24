@@ -155,7 +155,39 @@ test('PiAcpAgent: /copy says so when there is nothing to copy', async () => {
   const h = harness({ getLastAssistantText: async () => null })
   try {
     await h.agent.prompt({ sessionId: SESSION_ID, prompt: [{ type: 'text', text: '/copy' }] } as any)
-    assert.equal(h.texts().at(-1), 'No assistant message to copy yet.')
+    assert.equal(h.texts().at(-1), 'No assistant text to copy yet.')
+  } finally {
+    h.restore()
+  }
+})
+
+test('PiAcpAgent: /tree falls back to the flat entries when pi cannot build the tree', async () => {
+  const h = harness({
+    // pi recurses while building the tree and overflows on long sessions.
+    getTree: async () => {
+      throw new Error('pi get_tree failed: Maximum call stack size exceeded')
+    },
+    getEntries: async () => ({
+      entries: [
+        { type: 'model_change', id: 'e0', parentId: null, provider: 'test', modelId: 'alpha' },
+        { type: 'message', id: 'e1', parentId: 'e0', message: { role: 'user', content: 'Do the thing' } },
+        { type: 'message', id: 'e2', parentId: 'e1', message: { role: 'assistant', content: 'Done' } },
+        { type: 'message', id: 'e3', parentId: 'e1', message: { role: 'assistant', content: 'Abandoned' } }
+      ],
+      leafId: 'e2'
+    })
+  })
+
+  try {
+    await h.agent.prompt({ sessionId: SESSION_ID, prompt: [{ type: 'text', text: '/tree' }] } as any)
+
+    const text = h.texts().at(-1) ?? ''
+    assert.match(text, /Session tree: 4 entries, 1 branch point/)
+    assert.match(text, /Active branch: 3 entries/)
+    assert.match(text, /model: test\/alpha \(e0\)/)
+    assert.match(text, /user: Do the thing \(e1\)/)
+    assert.match(text, /assistant: Done \(e2\) <- current/)
+    assert.doesNotMatch(text, /Abandoned/)
   } finally {
     h.restore()
   }

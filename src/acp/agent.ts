@@ -127,8 +127,18 @@ function builtinAvailableCommands(): AvailableCommand[] {
 /** Entries shown for the active branch before the listing is truncated. */
 const TREE_BRANCH_LIMIT = 20
 
-type TreeEntry = { type?: unknown; id?: unknown; message?: unknown; name?: unknown; summary?: unknown }
+type TreeEntry = {
+  type?: unknown
+  id?: unknown
+  parentId?: unknown
+  message?: unknown
+  name?: unknown
+  summary?: unknown
+  provider?: unknown
+  modelId?: unknown
+}
 type TreeNode = { entry?: TreeEntry; children?: TreeNode[] }
+type SessionTreeSummary = { total: number; branchPoints: number; path: TreeEntry[]; leafId: string | null }
 
 function treeEntryLabel(entry: TreeEntry): string {
   const type = typeof entry.type === 'string' ? entry.type : 'entry'
@@ -143,6 +153,12 @@ function treeEntryLabel(entry: TreeEntry): string {
   if (type === 'session_info') return typeof entry.name === 'string' ? `name: ${entry.name}` : 'session info'
   if (type === 'compaction') return 'compaction'
   if (type === 'branch_summary') return 'branch summary'
+  if (type === 'model_change') {
+    const provider = typeof entry.provider === 'string' ? entry.provider : ''
+    const modelId = typeof entry.modelId === 'string' ? entry.modelId : ''
+    const model = [provider, modelId].filter(Boolean).join('/')
+    return model ? `model: ${model}` : 'model change'
+  }
   if (typeof entry.summary === 'string' && entry.summary.trim()) return `${type}: ${entry.summary.trim().slice(0, 80)}`
 
   return type
@@ -154,51 +170,79 @@ function messageText(content: unknown): string {
 
   return content
     .map(block =>
-      (block as { type?: unknown; text?: unknown })?.type === 'text'
-        ? String((block as { text?: unknown }).text ?? '')
-        : ''
+      (block as { type?: unknown }).type === 'text' ? String((block as { text?: unknown }).text ?? '') : ''
     )
     .filter(Boolean)
     .join(' ')
 }
 
-function countTreeEntries(nodes: TreeNode[]): number {
+/**
+ * pi's `get_tree` recurses while building the tree and blows the stack on long sessions, so
+ * `get_entries` is the fallback: the same entries as a flat list plus `leafId`, which is enough to
+ * count the tree and walk the active branch through `parentId` links.
+ */
+function summarizeTree(data: unknown): SessionTreeSummary {
+  const roots = Array.isArray((data as { tree?: unknown })?.tree) ? (data as { tree: TreeNode[] }).tree : []
+  const leafId = typeof (data as { leafId?: unknown })?.leafId === 'string' ? (data as { leafId: string }).leafId : null
+
   let total = 0
-  const stack = [...nodes]
+  let branchPoints = 0
+  const stack = [...roots]
   while (stack.length) {
     const node = stack.pop()
     if (!node) continue
     total += 1
-    for (const child of node.children ?? []) stack.push(child)
+    const children = node.children ?? []
+    if (children.length > 1) branchPoints += 1
+    for (const child of children) stack.push(child)
   }
-  return total
+
+  return { total, branchPoints, path: findPathToLeaf(roots, leafId), leafId }
 }
 
-/**
- * Render pi's session tree for a chat client: the tree can hold thousands of entries, so the
- * listing shows the active branch (most recent entries first) plus how much it is not showing.
- */
-function formatSessionTree(data: unknown): string {
-  const tree = Array.isArray((data as { tree?: unknown })?.tree) ? (data as { tree: TreeNode[] }).tree : []
+function summarizeEntries(data: unknown): SessionTreeSummary {
+  const entries = Array.isArray((data as { entries?: unknown })?.entries)
+    ? (data as { entries: TreeEntry[] }).entries
+    : []
   const leafId = typeof (data as { leafId?: unknown })?.leafId === 'string' ? (data as { leafId: string }).leafId : null
 
-  if (!tree.length) return 'Session tree is empty.'
+  const byId = new Map<string, TreeEntry>()
+  const childCount = new Map<string, number>()
+  for (const entry of entries) {
+    if (typeof entry.id !== 'string') continue
+    byId.set(entry.id, entry)
+    const parentId = typeof entry.parentId === 'string' ? entry.parentId : null
+    if (parentId) childCount.set(parentId, (childCount.get(parentId) ?? 0) + 1)
+  }
 
-  const total = countTreeEntries(tree)
-  const branchPoints = countBranchPoints(tree)
+  let branchPoints = 0
+  for (const count of childCount.values()) if (count > 1) branchPoints += 1
 
-  // Walk from a root to the leaf so the active branch is what gets listed.
-  const path = findPathToLeaf(tree, leafId)
-  const shown = path.slice(-TREE_BRANCH_LIMIT)
+  const path: TreeEntry[] = []
+  let cursor = leafId
+  while (cursor) {
+    const entry = byId.get(cursor)
+    if (!entry) break
+    path.unshift(entry)
+    cursor = typeof entry.parentId === 'string' ? entry.parentId : null
+  }
+
+  return { total: entries.length, branchPoints, path, leafId }
+}
+
+function formatSessionTree(summary: SessionTreeSummary): string {
+  if (!summary.total) return 'Session tree is empty.'
+
+  const shown = summary.path.slice(-TREE_BRANCH_LIMIT)
   const lines = [
-    `Session tree: ${total} entr${total === 1 ? 'y' : 'ies'}${branchPoints ? `, ${branchPoints} branch point${branchPoints === 1 ? '' : 's'}` : ''}`,
-    `Active branch: ${path.length} entr${path.length === 1 ? 'y' : 'ies'}${path.length > shown.length ? ` (showing the last ${shown.length})` : ''}`,
+    `Session tree: ${summary.total} entr${summary.total === 1 ? 'y' : 'ies'}${summary.branchPoints ? `, ${summary.branchPoints} branch point${summary.branchPoints === 1 ? '' : 's'}` : ''}`,
+    `Active branch: ${summary.path.length} entr${summary.path.length === 1 ? 'y' : 'ies'}${summary.path.length > shown.length ? ` (showing the last ${shown.length})` : ''}`,
     ''
   ]
 
   for (const entry of shown) {
     const id = typeof entry.id === 'string' ? entry.id.slice(0, 8) : '?'
-    const marker = leafId && entry.id === leafId ? ' <- current' : ''
+    const marker = summary.leafId && entry.id === summary.leafId ? ' <- current' : ''
     lines.push(`- ${treeEntryLabel(entry)} (${id})${marker}`)
   }
 
@@ -230,19 +274,6 @@ function findPathToLeaf(nodes: TreeNode[], leafId: string | null): TreeEntry[] {
   }
 
   return []
-}
-
-function countBranchPoints(nodes: TreeNode[]): number {
-  let count = 0
-  const stack = [...nodes]
-  while (stack.length) {
-    const node = stack.pop()
-    if (!node) continue
-    const children = node.children ?? []
-    if (children.length > 1) count += 1
-    for (const child of children) stack.push(child)
-  }
-  return count
 }
 
 function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
@@ -929,14 +960,19 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (cmd === 'tree') {
-        const data = (await session.proc.getTree()) as any
-        const text = formatSessionTree(data)
+        let summary: SessionTreeSummary
+        try {
+          summary = summarizeTree(await session.proc.getTree())
+        } catch {
+          // Long sessions overflow pi's recursive tree builder; the flat entry list still works.
+          summary = summarizeEntries(await session.proc.getEntries())
+        }
 
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text }
+            content: { type: 'text', text: formatSessionTree(summary) }
           }
         })
 
@@ -953,7 +989,7 @@ export class PiAcpAgent implements ACPAgent {
             sessionUpdate: 'agent_message_chunk',
             content: {
               type: 'text',
-              text: text ? `Last assistant message (select to copy):\n\n${text}` : 'No assistant message to copy yet.'
+              text: text ? `Last assistant message (select to copy):\n\n${text}` : 'No assistant text to copy yet.'
             }
           }
         })

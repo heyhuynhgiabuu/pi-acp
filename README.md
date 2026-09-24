@@ -164,7 +164,8 @@ ACP itself:
 - `/session` – show session stats (tokens/messages/cost/session file)
 - `/name <name>` – set session display name
 - `/tree` – show the session tree and the active branch (read-only; the tree can be thousands of
-  entries, so it lists the last 20 of the active branch)
+  entries, so it lists the last 20 of the active branch. Long sessions fall back to pi's flat entry
+  list because `get_tree` overflows the stack there)
 - `/copy` – re-print the last assistant message so the client can select and copy it (ACP has no
   clipboard access)
 - `/changelog` – print the installed pi changelog (best-effort)

@@ -138,6 +138,7 @@ export class PiAcpAgent implements ACPAgent {
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
+  private clientSupportsFormElicitation = false
   // Threads restored in parallel must not each start a pi process before any can be closed.
   private readonly spawnLimiter = new SpawnLimiter(maxConcurrentSpawns())
 
@@ -286,7 +287,8 @@ export class PiAcpAgent implements ACPAgent {
           conn: this.conn,
           proc,
           fileCommands,
-          onThinkingLevelChanged: (sessionId, proc) => this.refreshThinkingLevel(sessionId, proc)
+          onThinkingLevelChanged: (sessionId, proc) => this.refreshThinkingLevel(sessionId, proc),
+          supportsFormElicitation: () => this.clientSupportsFormElicitation
         })
       } catch (error) {
         try {
@@ -325,6 +327,9 @@ export class PiAcpAgent implements ACPAgent {
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     // We currently only support ACP protocol version 1.
+    // Elicitation is UNSTABLE in the pinned SDK, so only offer it when the client advertised it.
+    this.clientSupportsFormElicitation = Boolean((params as any)?.clientCapabilities?.elicitation?.form)
+
     const supportedVersion = 1
     const requested = params.protocolVersion
 
@@ -381,7 +386,8 @@ export class PiAcpAgent implements ACPAgent {
         conn: this.conn,
         fileCommands,
         piCommand: process.env.PI_ACP_PI_COMMAND,
-        onThinkingLevelChanged: (sessionId, proc) => this.refreshThinkingLevel(sessionId, proc)
+        onThinkingLevelChanged: (sessionId, proc) => this.refreshThinkingLevel(sessionId, proc),
+        supportsFormElicitation: () => this.clientSupportsFormElicitation
       })
     )
     ;(this.sessions as any).touch?.(session.sessionId)
@@ -1079,6 +1085,7 @@ export class PiAcpAgent implements ACPAgent {
       piToolCallId ? `${taskId}\u0000${piToolCallId}` : taskId
     const taskCallIdsByTask = new Map<string, Set<string>>()
     const toolResultIds = new Set<string>()
+    let replayedBashCount = 0
 
     for (const message of messages) {
       const toolCallId = typeof (message as any)?.toolCallId === 'string' ? (message as any).toolCallId : undefined
@@ -1313,6 +1320,64 @@ export class PiAcpAgent implements ACPAgent {
             content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
             rawOutput: m,
             ...(subagentSessionId ? { _meta: subagentSessionInfoMeta(subagentSessionId) } : {})
+          }
+        })
+        continue
+      }
+
+      if (role === 'bashExecution') {
+        // A shell command the user ran directly (or over RPC bash). It is not a tool result, so it
+        // has no toolCallId; replay it as a finished execute tool call to keep the transcript whole.
+        const command = String(m?.command ?? '')
+        const toolCallId = `bash-${replayedBashCount++}`
+        const output = typeof m?.output === 'string' ? m.output : ''
+        const failed = typeof m?.exitCode === 'number' && m.exitCode !== 0
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId,
+            title: command || 'bash',
+            kind: 'execute',
+            status: 'completed',
+            rawInput: { command }
+          }
+        })
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status: failed ? 'failed' : 'completed',
+            content: output ? [{ type: 'content', content: { type: 'text', text: output } }] : null,
+            rawOutput: {
+              output,
+              exitCode: m?.exitCode ?? null,
+              cancelled: Boolean(m?.cancelled),
+              truncated: Boolean(m?.truncated)
+            }
+          }
+        })
+        continue
+      }
+
+      if (role === 'branchSummary' || role === 'compactionSummary') {
+        // Context Pi inserted while summarizing a branch or compacting the transcript. The client
+        // shows the replayed conversation, so without this the summary would silently disappear.
+        const summary = typeof m?.summary === 'string' ? m.summary : ''
+        if (!summary) continue
+
+        const tokensBefore = Number(m?.tokensBefore)
+        const detail = Number.isFinite(tokensBefore) ? ` (tokens before: ${tokensBefore})` : ''
+        const label = role === 'branchSummary' ? 'Branch summary' : 'Compaction summary'
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `${label}${detail}:\n\n${summary}` }
           }
         })
       }

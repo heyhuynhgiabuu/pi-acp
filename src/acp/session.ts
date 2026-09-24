@@ -44,6 +44,7 @@ type SessionCreateParams = {
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
   onThinkingLevelChanged?: (sessionId: string, proc: PiRpcProcess) => void
+  supportsFormElicitation?: () => boolean
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -542,7 +543,8 @@ export class SessionManager {
       onSubagentTaskActive: (childSessionId, taskRunKey) => this.markSubagentSessionActive(childSessionId, taskRunKey),
       onSubagentTaskCompleted: (childSessionId, taskRunKey) =>
         this.markSubagentSessionCompleted(childSessionId, taskRunKey),
-      onThinkingLevelChanged: params.onThinkingLevelChanged
+      onThinkingLevelChanged: params.onThinkingLevelChanged,
+      supportsFormElicitation: params.supportsFormElicitation
     })
 
     this.sessions.set(sessionId, session)
@@ -575,7 +577,8 @@ export class SessionManager {
       onSubagentTaskActive: (childSessionId, taskRunKey) => this.markSubagentSessionActive(childSessionId, taskRunKey),
       onSubagentTaskCompleted: (childSessionId, taskRunKey) =>
         this.markSubagentSessionCompleted(childSessionId, taskRunKey),
-      onThinkingLevelChanged: params.onThinkingLevelChanged
+      onThinkingLevelChanged: params.onThinkingLevelChanged,
+      supportsFormElicitation: params.supportsFormElicitation
     })
 
     this.sessions.set(sessionId, session)
@@ -612,6 +615,7 @@ export class PiAcpSession {
   private readonly onSubagentTaskActive?: (childSessionId: string, taskRunKey: string) => void
   private readonly onSubagentTaskCompleted?: (childSessionId: string, taskRunKey: string) => void
   private readonly onThinkingLevelChanged?: (sessionId: string, proc: PiRpcProcess) => void
+  private readonly supportsFormElicitation?: () => boolean
   private readonly taskToolCalls = new Map<string, { toolCallId: string; status: 'completed' | 'failed' }>()
   private readonly taskSessionIds = new Map<string, string>()
   private readonly taskChildSessionIds = new Map<string, string>()
@@ -646,6 +650,7 @@ export class PiAcpSession {
     onSubagentTaskActive?: (childSessionId: string, taskRunKey: string) => void
     onSubagentTaskCompleted?: (childSessionId: string, taskRunKey: string) => void
     onThinkingLevelChanged?: (sessionId: string, proc: PiRpcProcess) => void
+    supportsFormElicitation?: () => boolean
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -657,6 +662,7 @@ export class PiAcpSession {
     this.onSubagentTaskActive = opts.onSubagentTaskActive
     this.onSubagentTaskCompleted = opts.onSubagentTaskCompleted
     this.onThinkingLevelChanged = opts.onThinkingLevelChanged
+    this.supportsFormElicitation = opts.supportsFormElicitation
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -1446,14 +1452,7 @@ export class PiAcpSession {
     }
 
     if (method === 'input' || method === 'editor') {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: {
-          type: 'text',
-          text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
-        } satisfies ContentBlock
-      })
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      await this.handleExtensionTextInput(ev, id, method)
       return
     }
 
@@ -1481,6 +1480,50 @@ export class PiAcpSession {
     if (method === 'setStatus' || method === 'setWidget' || method === 'set_editor_text') return
 
     await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+  }
+
+  /**
+   * Pi asks for free-form text. ACP expresses that as an elicitation form, but the capability is
+   * marked UNSTABLE in the pinned SDK, so it is only used when the client advertised form support.
+   */
+  private async handleExtensionTextInput(ev: PiRpcEvent, id: string, method: string): Promise<void> {
+    if (!this.supportsFormElicitation?.()) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: `Pi ${method} request needs a client that supports ACP elicitation; cancelling it.`
+        } satisfies ContentBlock
+      })
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    const title = stringProp(ev, 'title') ?? (method === 'editor' ? 'Edit text' : 'Enter a value')
+    const placeholder = stringProp(ev, 'placeholder')
+    const prefill = stringProp(ev, 'prefill')
+
+    const response = (await this.conn.unstable_createElicitation({
+      sessionId: this.sessionId,
+      mode: 'form',
+      message: title,
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          value: {
+            type: 'string',
+            title,
+            ...(placeholder ? { description: placeholder } : {}),
+            ...(prefill ? { default: prefill } : {})
+          }
+        },
+        required: ['value']
+      }
+    } as any)) as any
+
+    const content = response?.action === 'accept' ? response.content : null
+    const value = typeof content?.value === 'string' ? content.value : null
+    await this.proc.sendExtensionUiResponse(value === null ? { id, cancelled: true } : { id, value })
   }
 
   private async handleExtensionSelect(ev: PiRpcEvent, id: string): Promise<void> {

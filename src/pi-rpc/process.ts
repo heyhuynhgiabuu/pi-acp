@@ -49,6 +49,7 @@ type PiRpcCommand =
   | { type: 'set_session_name'; id?: string; name: string }
   | { type: 'export_html'; id?: string; outputPath?: string }
   | { type: 'switch_session'; id?: string; sessionPath: string }
+  | { type: 'clone'; id?: string }
   // Messages
   | { type: 'get_messages'; id?: string }
   // Commands
@@ -388,6 +389,16 @@ export class PiRpcProcess {
   async switchSession(sessionPath: string): Promise<void> {
     const res = await this.request({ type: 'switch_session', sessionPath })
     if (!res.success) throw new Error(`pi switch_session failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  /**
+   * Duplicate the active branch into a new session. pi rebinds this process to the clone, so the
+   * caller has to re-read `getState()` to learn the new session id and file.
+   */
+  async clone(): Promise<{ cancelled?: boolean } | null> {
+    const res = await this.request({ type: 'clone' })
+    if (!res.success) throw new Error(`pi clone failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return (res.data ?? null) as { cancelled?: boolean } | null
   }
 
   async getMessages(): Promise<unknown> {

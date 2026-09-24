@@ -141,3 +141,26 @@ test('PiAcpSession: forwards a thinking level change to the client', async () =>
   assert.equal(update?.update?.currentModeId, 'xhigh')
   assert.deepEqual(seen, ['s1:proc'])
 })
+
+test('PiAcpSession: reports a summarization retry', async () => {
+  const { proc, conn } = createSession()
+  await flush()
+
+  proc.emit({
+    type: 'summarization_retry_scheduled',
+    attempt: 2,
+    maxAttempts: 3,
+    delayMs: 2400,
+    errorMessage: 'terminated'
+  } as any)
+  await flush()
+  assert.match(texts(conn).at(-1) ?? '', /Retrying context summarization \(attempt 2\/3, waiting 2s\)/)
+
+  proc.emit({ type: 'summarization_retry_scheduled', source: 'branchSummary' } as any)
+  await flush()
+  assert.match(texts(conn).at(-1) ?? '', /Retrying branch summary\.\.\./)
+
+  proc.emit({ type: 'summarization_retry_finished' } as any)
+  await flush()
+  assert.match(texts(conn).at(-1) ?? '', /Summarization retry finished/)
+})

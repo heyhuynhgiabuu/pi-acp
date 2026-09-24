@@ -1351,6 +1351,22 @@ export class PiAcpSession {
         break
       }
 
+      case 'summarization_retry_scheduled': {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: formatSummarizationRetry(ev) } satisfies ContentBlock
+        })
+        break
+      }
+
+      case 'summarization_retry_finished': {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Summarization retry finished.' } satisfies ContentBlock
+        })
+        break
+      }
+
       case 'auto_compaction_start':
       case 'compaction_start': {
         // pi renamed these from `auto_compaction_*`; keep both shapes. A manual compaction is
@@ -1660,6 +1676,22 @@ function formatExtensionError(ev: PiRpcEvent): string {
   const error = stringProp(ev, 'error') ?? 'unknown error'
 
   return `Extension error in ${name}${handler ? ` (${handler})` : ''}: ${error}`
+}
+
+function formatSummarizationRetry(ev: PiRpcEvent): string {
+  const attempt = Number((ev as any).attempt)
+  const maxAttempts = Number((ev as any).maxAttempts)
+  const delayMs = Number((ev as any).delayMs)
+  const source = stringProp(ev, 'source') === 'branchSummary' ? 'branch summary' : 'context summarization'
+
+  if (!Number.isFinite(attempt) || !Number.isFinite(maxAttempts) || !Number.isFinite(delayMs)) {
+    return `Retrying ${source}...`
+  }
+
+  let delaySeconds = Math.round(delayMs / 1000)
+  if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
+
+  return `Retrying ${source} (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
 }
 
 function formatAutoRetryMessage(ev: PiRpcEvent): string {

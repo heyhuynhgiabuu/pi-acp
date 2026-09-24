@@ -1,4 +1,8 @@
 import {
+  ForkSessionRequest,
+  ForkSessionResponse,
+  ResumeSessionRequest,
+  ResumeSessionResponse,
   RequestError,
   type Agent as ACPAgent,
   type AgentSideConnection,
@@ -362,7 +366,11 @@ export class PiAcpAgent implements ACPAgent {
           delete: {},
           // Without this, a client that closes a thread never tells us, so its pi
           // subprocess lingers until the next session/new or session/load.
-          close: {}
+          close: {},
+          // Restore a thread the client already has the transcript for, without replaying it.
+          resume: {},
+          // **UNSTABLE** Fork a thread; mapped to pi's `clone` (see forkSession).
+          fork: {}
         }
       }
     }
@@ -1031,50 +1039,73 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    return this.withSessionLease(params.sessionId, () => this.loadSessionInternal(params))
+    return this.withSessionLease(params.sessionId, () => this.loadSessionInternal(params, { replay: true }))
   }
 
-  private async loadSessionInternal(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    if (!isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
-    }
+  /**
+   * ACP `session/resume`: restore a session for a client that already holds its transcript, so the
+   * conversation continues without replaying every message again.
+   */
+  async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    const loaded = await this.withSessionLease(params.sessionId, () =>
+      this.loadSessionInternal(params, { replay: false })
+    )
 
-    // If the client is re-loading a session that is already active, tear down the existing
-    // pi subprocess so we can start fresh and re-advertise commands reliably.
-    // (Some clients may call session/load when restoring from history.)
-    this.sessions.close(params.sessionId)
+    return { configOptions: loaded.configOptions, modes: loaded.modes, _meta: loaded._meta }
+  }
 
-    this.lastSessionCwd = params.cwd
+  /**
+   * ACP `session/fork`: start a new session from an existing one. pi's `clone` duplicates the
+   * active branch at the current position, which is the closest match to what ACP describes. The
+   * clone rebinds the source session's process to the fork, so the process is handed back here and
+   * both threads restore their own on demand.
+   */
+  async forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    return this.withSessionLease(params.sessionId, async () => {
+      if (!isAbsolute(params.cwd)) {
+        throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+      }
 
-    const stored = this.findStoredSession(params.sessionId)
-    if (!stored) {
-      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
-    }
+      const source = await this.restoreSession(params.sessionId, {
+        cwd: params.cwd,
+        mcpServers: params.mcpServers
+      })
+      const proc = source.proc
 
-    const enableSkillCommands = getEnableSkillCommands(params.cwd)
+      const result = await proc.clone()
+      if (result?.cancelled) {
+        throw RequestError.internalError({}, 'The fork was cancelled by a pi extension.')
+      }
 
-    // Close the previous threads' processes before starting another one. The policy below
-    // only runs at the end of a load, so staggered restores (a client restoring several
-    // threads over a few seconds) would otherwise keep every finished load resident until
-    // the next one completes.
-    this.sessions.closeAllExcept(this.sessions.sessionLineageIds(params.sessionId))
+      const state = (await proc.getState()) as any
+      const forkedSessionId = typeof state?.sessionId === 'string' ? state.sessionId : null
+      const forkedSessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
 
-    const session = await this.restoreSession(params.sessionId, {
-      cwd: params.cwd,
-      mcpServers: params.mcpServers
+      if (!forkedSessionId || !forkedSessionFile || forkedSessionId === params.sessionId) {
+        throw RequestError.internalError({}, 'pi did not report a forked session.')
+      }
+
+      this.store.upsert({ sessionId: forkedSessionId, cwd: params.cwd, sessionFile: forkedSessionFile })
+
+      const { configOptions, modes } = await getSessionConfiguration(proc, { state })
+
+      // The process serves the fork now; either thread restores its own process when used again.
+      this.sessions.close(params.sessionId)
+
+      return { sessionId: forkedSessionId, configOptions, modes }
     })
-    ;(this.sessions as any).touch?.(session.sessionId)
-    const proc = session.proc
-    const fileCommands = loadSlashCommands(params.cwd)
+  }
 
-    // (Optional) ensure mapping stays fresh.
-    this.store.upsert({
-      sessionId: params.sessionId,
-      cwd: params.cwd,
-      sessionFile: stored.sessionFile
-    })
-
-    // Replay full conversation history.
+  /**
+   * Replay a session's transcript to the client. Shared by `session/load`, which replays, and
+   * `session/resume`, which deliberately does not.
+   */
+  private async replaySessionMessages(
+    session: PiAcpSession,
+    proc: PiRpcProcess,
+    cwd: string,
+    sessionFile: string
+  ): Promise<void> {
     const data = (await proc.getMessages()) as any
     const messages = Array.isArray(data?.messages) ? data.messages : []
     const taskToolCalls = new Map<string, { toolCallId: string; status: 'completed' | 'failed' }>()
@@ -1160,7 +1191,7 @@ export class PiAcpAgent implements ACPAgent {
       if (!linkedTaskCalls.has(key) && !taskSessionIds.has(key)) taskToolCalls.delete(key)
     }
 
-    for (const taskEvent of await readPiTaskSessionEventsFromSessionFile(stored.sessionFile)) {
+    for (const taskEvent of await readPiTaskSessionEventsFromSessionFile(sessionFile)) {
       if (taskEvent.kind !== 'task-session' || !taskEvent.sessionId) continue
       const callIds = taskCallIdsByTask.get(taskEvent.taskId)
       const piToolCallId = taskEvent.piToolCallId ?? (callIds?.size === 1 ? [...callIds][0] : undefined)
@@ -1277,7 +1308,7 @@ export class PiAcpAgent implements ACPAgent {
               kind: 'execute',
               status: 'completed',
               content: bashTerminalContent(toolCallId),
-              _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+              _meta: bashTerminalInfoMeta(toolCallId, cwd)
             }
           })
 
@@ -1381,6 +1412,54 @@ export class PiAcpAgent implements ACPAgent {
           }
         })
       }
+    }
+  }
+
+  private async loadSessionInternal(
+    params: LoadSessionRequest | ResumeSessionRequest,
+    opts: { replay: boolean }
+  ): Promise<LoadSessionResponse> {
+    if (!isAbsolute(params.cwd)) {
+      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+    }
+
+    // If the client is re-loading a session that is already active, tear down the existing
+    // pi subprocess so we can start fresh and re-advertise commands reliably.
+    // (Some clients may call session/load when restoring from history.)
+    this.sessions.close(params.sessionId)
+
+    this.lastSessionCwd = params.cwd
+
+    const stored = this.findStoredSession(params.sessionId)
+    if (!stored) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+    }
+
+    const enableSkillCommands = getEnableSkillCommands(params.cwd)
+
+    // Close the previous threads' processes before starting another one. The policy below
+    // only runs at the end of a load, so staggered restores (a client restoring several
+    // threads over a few seconds) would otherwise keep every finished load resident until
+    // the next one completes.
+    this.sessions.closeAllExcept(this.sessions.sessionLineageIds(params.sessionId))
+
+    const session = await this.restoreSession(params.sessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers ?? []
+    })
+    ;(this.sessions as any).touch?.(session.sessionId)
+    const proc = session.proc
+    const fileCommands = loadSlashCommands(params.cwd)
+
+    // (Optional) ensure mapping stays fresh.
+    this.store.upsert({
+      sessionId: params.sessionId,
+      cwd: params.cwd,
+      sessionFile: stored.sessionFile
+    })
+
+    if (opts.replay) {
+      await this.replaySessionMessages(session, proc, params.cwd, stored.sessionFile)
     }
 
     // A finished subagent thread does not need a resident pi process: the client already has

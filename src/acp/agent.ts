@@ -315,8 +315,10 @@ export class PiAcpAgent implements ACPAgent {
     return {
       protocolVersion: requested === supportedVersion ? requested : supportedVersion,
       agentInfo: {
+        // `name` is the logical identity (clients use it for telemetry and identification);
+        // `title` is what ACP defines for user-facing display.
         name: pkg.name ?? 'pi-acp',
-        title: 'pi ACP adapter',
+        title: 'Pi Coding Agent',
         version: pkg.version ?? '0.0.0'
       },
       // Zed currently uses ClientCapabilities._meta["terminal-auth"] to decide whether to show

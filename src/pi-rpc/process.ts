@@ -52,6 +52,8 @@ type PiRpcCommand =
   | { type: 'clone'; id?: string }
   // Messages
   | { type: 'get_messages'; id?: string }
+  | { type: 'get_tree'; id?: string }
+  | { type: 'get_last_assistant_text'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
 
@@ -405,6 +407,19 @@ export class PiRpcProcess {
     const res = await this.request({ type: 'get_messages' })
     if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
+  }
+
+  async getTree(): Promise<unknown> {
+    const res = await this.request({ type: 'get_tree' })
+    if (!res.success) throw new Error(`pi get_tree failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  async getLastAssistantText(): Promise<string | null> {
+    const res = await this.request({ type: 'get_last_assistant_text' })
+    if (!res.success) throw new Error(`pi get_last_assistant_text failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const text = (res.data as { text?: unknown } | null)?.text
+    return typeof text === 'string' && text.trim() ? text : null
   }
 
   async getCommands(): Promise<unknown> {

@@ -154,27 +154,39 @@ Loaded from:
 
 #### 2) Built-in commands
 
+pi's own built-ins are terminal commands, not part of its RPC surface (`get_commands` returns only
+extension commands, prompt templates, and skills), so the adapter implements the ones that map onto
+ACP itself:
+
 - `/compact [instructions...]` – run pi compaction (optionally with custom instructions)
 - `/autocompact on|off|toggle` – toggle automatic compaction
 - `/export` – export the current session to HTML in the session `cwd`
 - `/session` – show session stats (tokens/messages/cost/session file)
 - `/name <name>` – set session display name
-- `/queue all|one-at-a-time` – set pi queue mode (unstable feature)
+- `/tree` – show the session tree and the active branch (read-only; the tree can be thousands of
+  entries, so it lists the last 20 of the active branch)
+- `/copy` – re-print the last assistant message so the client can select and copy it (ACP has no
+  clipboard access)
 - `/changelog` – print the installed pi changelog (best-effort)
-- `/steering` - maps to `pi` Steering Mode, get/set
-- `/follow-up` - pats to `pi` Follow-up Mode, get/set
+- `/steering` – get/set pi's steering mode (pi's own queue; see below)
+- `/follow-up` – get/set pi's follow-up mode (pi's own queue; see below)
 
-Other built-in commands:
+The remaining pi built-ins are not available through ACP:
 
-- `/model` - not implemented (use the model selector UI in Zed)
-- `/thinking` - maps to 'mode' selector in Zed
-- `/clear` - not implemented (use ACP client 'new' command)
+| pi command                                                      | Why it is not here                                                                                                                                                                                                                    |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/model`, `/thinking`, `/scoped-models`                         | Covered by the ACP model and thinking selectors in the client                                                                                                                                                                         |
+| `/settings`, `/hotkeys`, `/quit`, `/reload`, `/trust`, `/llama` | Terminal UI or pi-process concerns; the client owns its own settings and lifecycle                                                                                                                                                    |
+| `/login`, `/logout`                                             | Provider auth belongs to pi; use the client's Authenticate action (terminal login) or run `pi`                                                                                                                                        |
+| `/new`, `/resume`, `/import`, `/fork`, `/clone`                 | They switch or create the session the client is attached to, and ACP gives the adapter no way to move the client to another thread. Use the client's thread picker; `session/fork` and `session/resume` cover clients that ask for it |
+| `/share`, `/bug`                                                | Upload or report actions with external side effects                                                                                                                                                                                   |
+| `/copy`                                                         | Available as `/copy` above, re-printed for the client to copy instead of touching the clipboard                                                                                                                                       |
 
 #### 3) Skill commands
 
 - Skill commands can be enabled in pi settings and will appear in the slash command list in ACP client as `/skill:skill-name`.
 
-**Note**: Slash commands provided by pi extensions are not currently supported.
+**Note**: commands registered by pi extensions are forwarded too (`get_commands` returns extension commands, prompt templates, and skills), so they appear in the client together with the built-ins above. Extension commands that drive pi's own terminal UI are the exception.
 
 ## Authentication (ACP Registry support)
 

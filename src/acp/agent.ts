@@ -110,10 +110,139 @@ function builtinAvailableCommands(): AvailableCommand[] {
       input: { hint: '(no args to show) all | one-at-a-time' }
     },
     {
+      name: 'tree',
+      description: 'Show the session tree and the active branch'
+    },
+    {
+      name: 'copy',
+      description: 'Re-print the last assistant message so the client can copy it'
+    },
+    {
       name: 'changelog',
       description: 'Show pi changelog'
     }
   ]
+}
+
+/** Entries shown for the active branch before the listing is truncated. */
+const TREE_BRANCH_LIMIT = 20
+
+type TreeEntry = { type?: unknown; id?: unknown; message?: unknown; name?: unknown; summary?: unknown }
+type TreeNode = { entry?: TreeEntry; children?: TreeNode[] }
+
+function treeEntryLabel(entry: TreeEntry): string {
+  const type = typeof entry.type === 'string' ? entry.type : 'entry'
+
+  if (type === 'message') {
+    const message = (entry.message ?? {}) as { role?: unknown; content?: unknown }
+    const role = typeof message.role === 'string' ? message.role : 'message'
+    const text = messageText(message.content).replace(/\s+/g, ' ').trim()
+    return text ? `${role}: ${text.slice(0, 80)}` : role
+  }
+
+  if (type === 'session_info') return typeof entry.name === 'string' ? `name: ${entry.name}` : 'session info'
+  if (type === 'compaction') return 'compaction'
+  if (type === 'branch_summary') return 'branch summary'
+  if (typeof entry.summary === 'string' && entry.summary.trim()) return `${type}: ${entry.summary.trim().slice(0, 80)}`
+
+  return type
+}
+
+function messageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+
+  return content
+    .map(block =>
+      (block as { type?: unknown; text?: unknown })?.type === 'text'
+        ? String((block as { text?: unknown }).text ?? '')
+        : ''
+    )
+    .filter(Boolean)
+    .join(' ')
+}
+
+function countTreeEntries(nodes: TreeNode[]): number {
+  let total = 0
+  const stack = [...nodes]
+  while (stack.length) {
+    const node = stack.pop()
+    if (!node) continue
+    total += 1
+    for (const child of node.children ?? []) stack.push(child)
+  }
+  return total
+}
+
+/**
+ * Render pi's session tree for a chat client: the tree can hold thousands of entries, so the
+ * listing shows the active branch (most recent entries first) plus how much it is not showing.
+ */
+function formatSessionTree(data: unknown): string {
+  const tree = Array.isArray((data as { tree?: unknown })?.tree) ? (data as { tree: TreeNode[] }).tree : []
+  const leafId = typeof (data as { leafId?: unknown })?.leafId === 'string' ? (data as { leafId: string }).leafId : null
+
+  if (!tree.length) return 'Session tree is empty.'
+
+  const total = countTreeEntries(tree)
+  const branchPoints = countBranchPoints(tree)
+
+  // Walk from a root to the leaf so the active branch is what gets listed.
+  const path = findPathToLeaf(tree, leafId)
+  const shown = path.slice(-TREE_BRANCH_LIMIT)
+  const lines = [
+    `Session tree: ${total} entr${total === 1 ? 'y' : 'ies'}${branchPoints ? `, ${branchPoints} branch point${branchPoints === 1 ? '' : 's'}` : ''}`,
+    `Active branch: ${path.length} entr${path.length === 1 ? 'y' : 'ies'}${path.length > shown.length ? ` (showing the last ${shown.length})` : ''}`,
+    ''
+  ]
+
+  for (const entry of shown) {
+    const id = typeof entry.id === 'string' ? entry.id.slice(0, 8) : '?'
+    const marker = leafId && entry.id === leafId ? ' <- current' : ''
+    lines.push(`- ${treeEntryLabel(entry)} (${id})${marker}`)
+  }
+
+  return lines.join('\n')
+}
+
+function findPathToLeaf(nodes: TreeNode[], leafId: string | null): TreeEntry[] {
+  const walk = (node: TreeNode): TreeEntry[] | null => {
+    const entry = node.entry ?? {}
+    const children = node.children ?? []
+
+    if (!children.length) {
+      // A leaf ends the path only when it is the requested leaf, or when there is no leaf id.
+      if (!leafId || entry.id === leafId) return [entry]
+      return null
+    }
+
+    for (const child of children) {
+      const childPath = walk(child)
+      if (childPath) return [entry, ...childPath]
+    }
+
+    return [entry]
+  }
+
+  for (const node of nodes) {
+    const path = walk(node)
+    if (path) return path
+  }
+
+  return []
+}
+
+function countBranchPoints(nodes: TreeNode[]): number {
+  let count = 0
+  const stack = [...nodes]
+  while (stack.length) {
+    const node = stack.pop()
+    if (!node) continue
+    const children = node.children ?? []
+    if (children.length > 1) count += 1
+    for (const child of children) stack.push(child)
+  }
+  return count
 }
 
 function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
@@ -793,6 +922,39 @@ export class PiAcpAgent implements ACPAgent {
           update: {
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: `Follow-up mode set to: ${modeRaw}` + QUEUE_MODE_NOTE }
+          }
+        })
+
+        return { stopReason: 'end_turn' }
+      }
+
+      if (cmd === 'tree') {
+        const data = (await session.proc.getTree()) as any
+        const text = formatSessionTree(data)
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text }
+          }
+        })
+
+        return { stopReason: 'end_turn' }
+      }
+
+      if (cmd === 'copy') {
+        // ACP has no clipboard access, so re-print the message for the client to select.
+        const text = await session.proc.getLastAssistantText()
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: text ? `Last assistant message (select to copy):\n\n${text}` : 'No assistant message to copy yet.'
+            }
           }
         })
 

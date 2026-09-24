@@ -43,6 +43,7 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  onThinkingLevelChanged?: (sessionId: string, proc: PiRpcProcess) => void
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -540,7 +541,8 @@ export class SessionManager {
       onSubagentSession: childSessionId => this.registerSubagentSession(sessionId, childSessionId),
       onSubagentTaskActive: (childSessionId, taskRunKey) => this.markSubagentSessionActive(childSessionId, taskRunKey),
       onSubagentTaskCompleted: (childSessionId, taskRunKey) =>
-        this.markSubagentSessionCompleted(childSessionId, taskRunKey)
+        this.markSubagentSessionCompleted(childSessionId, taskRunKey),
+      onThinkingLevelChanged: params.onThinkingLevelChanged
     })
 
     this.sessions.set(sessionId, session)
@@ -572,7 +574,8 @@ export class SessionManager {
       onSubagentSession: childSessionId => this.registerSubagentSession(sessionId, childSessionId),
       onSubagentTaskActive: (childSessionId, taskRunKey) => this.markSubagentSessionActive(childSessionId, taskRunKey),
       onSubagentTaskCompleted: (childSessionId, taskRunKey) =>
-        this.markSubagentSessionCompleted(childSessionId, taskRunKey)
+        this.markSubagentSessionCompleted(childSessionId, taskRunKey),
+      onThinkingLevelChanged: params.onThinkingLevelChanged
     })
 
     this.sessions.set(sessionId, session)
@@ -608,6 +611,7 @@ export class PiAcpSession {
   private readonly onSubagentSession?: (sessionId: string) => void
   private readonly onSubagentTaskActive?: (childSessionId: string, taskRunKey: string) => void
   private readonly onSubagentTaskCompleted?: (childSessionId: string, taskRunKey: string) => void
+  private readonly onThinkingLevelChanged?: (sessionId: string, proc: PiRpcProcess) => void
   private readonly taskToolCalls = new Map<string, { toolCallId: string; status: 'completed' | 'failed' }>()
   private readonly taskSessionIds = new Map<string, string>()
   private readonly taskChildSessionIds = new Map<string, string>()
@@ -641,6 +645,7 @@ export class PiAcpSession {
     onSubagentSession?: (sessionId: string) => void
     onSubagentTaskActive?: (childSessionId: string, taskRunKey: string) => void
     onSubagentTaskCompleted?: (childSessionId: string, taskRunKey: string) => void
+    onThinkingLevelChanged?: (sessionId: string, proc: PiRpcProcess) => void
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -651,6 +656,7 @@ export class PiAcpSession {
     this.onSubagentSession = opts.onSubagentSession
     this.onSubagentTaskActive = opts.onSubagentTaskActive
     this.onSubagentTaskCompleted = opts.onSubagentTaskCompleted
+    this.onThinkingLevelChanged = opts.onThinkingLevelChanged
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -1339,24 +1345,57 @@ export class PiAcpSession {
         break
       }
 
-      case 'auto_compaction_start': {
+      case 'auto_compaction_start':
+      case 'compaction_start': {
+        // pi renamed these from `auto_compaction_*`; keep both shapes. A manual compaction is
+        // already reported by the /compact command response, so only automatic ones get a notice.
+        if (stringProp(ev, 'reason') === 'manual') break
+
         this.emit({
           sessionUpdate: 'agent_message_chunk',
           content: {
             type: 'text',
-            text: 'Context nearing limit, running automatic compaction...'
+            text:
+              stringProp(ev, 'reason') === 'overflow'
+                ? 'Context exceeded the model window, compacting before retrying...'
+                : 'Context nearing limit, running automatic compaction...'
           } satisfies ContentBlock
         })
         break
       }
 
-      case 'auto_compaction_end': {
+      case 'auto_compaction_end':
+      case 'compaction_end': {
+        if (stringProp(ev, 'reason') === 'manual') break
+
         this.emit({
           sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Automatic compaction finished; context was summarized to continue the session.'
-          } satisfies ContentBlock
+          content: { type: 'text', text: formatCompactionEnd(ev) } satisfies ContentBlock
+        })
+        break
+      }
+
+      case 'session_info_changed': {
+        // The name can change outside /name (pi's own UI or an extension), so keep the client's
+        // thread title in sync instead of only updating it when the command runs.
+        this.emit({ sessionUpdate: 'session_info_update', title: stringProp(ev, 'name') })
+        break
+      }
+
+      case 'thinking_level_changed': {
+        const level = stringProp(ev, 'level')
+        if (!level) break
+
+        this.emit({ sessionUpdate: 'current_mode_update', currentModeId: level })
+        this.onThinkingLevelChanged?.(this.sessionId, this.proc)
+        break
+      }
+
+      case 'extension_error': {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: formatExtensionError(ev) } satisfies ContentBlock,
+          _meta: { piAcp: { notify: { level: 'warning' } } }
         })
         break
       }
@@ -1545,6 +1584,39 @@ function optionIndex(optionId: string): number | null {
 
   const index = Number(rawIndex)
   return Number.isSafeInteger(index) && index >= 0 && String(index) === rawIndex ? index : null
+}
+
+function formatCompactionEnd(ev: PiRpcEvent): string {
+  if (ev.aborted === true) return 'Compaction was aborted.'
+
+  const errorMessage = stringProp(ev, 'errorMessage')
+  if (errorMessage) return `Compaction failed: ${errorMessage}`
+
+  const result = asRecord(ev.result)
+  const summary = stringProp(result ?? {}, 'summary')
+  const tokensBefore = Number(result?.tokensBefore)
+  const estimatedAfter = Number(result?.estimatedTokensAfter)
+
+  const detail = [
+    Number.isFinite(tokensBefore) ? `tokens before: ${tokensBefore}` : null,
+    Number.isFinite(estimatedAfter) ? `after: ~${estimatedAfter}` : null
+  ]
+    .filter(Boolean)
+    .join(', ')
+
+  const base = summary
+    ? `Compaction finished: ${summary}`
+    : 'Automatic compaction finished; context was summarized to continue the session.'
+  return detail ? `${base} (${detail})` : base
+}
+
+function formatExtensionError(ev: PiRpcEvent): string {
+  const path = stringProp(ev, 'extensionPath')
+  const name = path ? (path.split('/').at(-1) ?? path) : 'extension'
+  const handler = stringProp(ev, 'event')
+  const error = stringProp(ev, 'error') ?? 'unknown error'
+
+  return `Extension error in ${name}${handler ? ` (${handler})` : ''}: ${error}`
 }
 
 function formatAutoRetryMessage(ev: PiRpcEvent): string {

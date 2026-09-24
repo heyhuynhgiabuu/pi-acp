@@ -285,7 +285,8 @@ export class PiAcpAgent implements ACPAgent {
           mcpServers: opts?.mcpServers ?? [],
           conn: this.conn,
           proc,
-          fileCommands
+          fileCommands,
+          onThinkingLevelChanged: (sessionId, proc) => this.refreshThinkingLevel(sessionId, proc)
         })
       } catch (error) {
         try {
@@ -309,6 +310,17 @@ export class PiAcpAgent implements ACPAgent {
     } finally {
       this.restoringSessions.delete(sessionId)
     }
+  }
+
+  /**
+   * pi can change the thinking level on its own (for example when a model switch forces a level
+   * that model supports). Refresh the client's config options so they do not show a stale value;
+   * the session already sent the mode update.
+   */
+  private refreshThinkingLevel(sessionId: string, proc: PiRpcProcess): void {
+    void emitConfigOptionsUpdate(this.conn, sessionId, proc).catch(() => {
+      // best-effort: the mode update the session sent is enough on its own
+    })
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -368,7 +380,8 @@ export class PiAcpAgent implements ACPAgent {
         mcpServers: params.mcpServers,
         conn: this.conn,
         fileCommands,
-        piCommand: process.env.PI_ACP_PI_COMMAND
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        onThinkingLevelChanged: (sessionId, proc) => this.refreshThinkingLevel(sessionId, proc)
       })
     )
     ;(this.sessions as any).touch?.(session.sessionId)

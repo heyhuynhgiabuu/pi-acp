@@ -12,6 +12,16 @@ export type PiSessionListItem = {
 
 const DEFAULT_TAIL_BYTES = 256 * 1024
 const DEFAULT_HEAD_BYTES = 64 * 1024
+// Lines are parsed one by one only for candidate entries found by substring search. The budgets
+// keep a pathological file (no matching entry at all) from turning into a full-file scan.
+const MAX_CANDIDATE_PARSES = 64
+
+/**
+ * Results are cached per file and reused while size and mtime stay the same. Listing a few hundred
+ * sessions otherwise re-reads and re-parses every transcript on every call.
+ */
+type SessionFileInfo = { sessionId: string; cwd: string; title: string | null; updatedAt: string | null }
+const fileInfoCache = new Map<string, { size: number; mtimeMs: number; info: SessionFileInfo | null }>()
 
 function getPiAgentDir(): string {
   // pi supports overriding config dir via PI_CODING_AGENT_DIR.
@@ -58,18 +68,13 @@ function walkJsonlFiles(dir: string, out: string[]) {
   }
 }
 
-function readFirstLine(path: string): string | null {
-  // Avoid reading the whole file.
+function readHead(path: string, bytes = DEFAULT_HEAD_BYTES): string {
   const fd = openSync(path, 'r')
   try {
-    const buf = Buffer.alloc(DEFAULT_HEAD_BYTES)
+    const buf = Buffer.alloc(bytes)
     const n = readSync(fd, buf, 0, buf.length, 0)
-    if (n <= 0) return null
-    const s = buf.subarray(0, n).toString('utf-8')
-    const idx = s.indexOf('\n')
-    return idx === -1 ? s.trim() : s.slice(0, idx).trim()
-  } catch {
-    return null
+    if (n <= 0) return ''
+    return buf.subarray(0, n).toString('utf-8')
   } finally {
     try {
       closeSync(fd)
@@ -77,6 +82,12 @@ function readFirstLine(path: string): string | null {
       // ignore
     }
   }
+}
+
+function firstLineOf(head: string): string | null {
+  if (!head) return null
+  const idx = head.indexOf('\n')
+  return (idx === -1 ? head : head.slice(0, idx)).trim() || null
 }
 
 function readTail(path: string, tailBytes = DEFAULT_TAIL_BYTES): string {
@@ -111,173 +122,137 @@ function parseSessionHeader(firstLine: string): { sessionId: string; cwd: string
   }
 }
 
-function pickTitleFromTail(tail: string): string | null {
-  // Try to find the *latest* session_info entry (stores the user-provided name).
-  // We scan backwards line-by-line.
-  const lines = tail.split(/\r?\n/)
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim()
-    if (!line) continue
-    try {
-      const obj = JSON.parse(line) as any
-      if (obj?.type === 'session_info' && typeof obj?.name === 'string' && obj.name.trim()) {
-        return obj.name.trim()
-      }
-    } catch {
-      // ignore
-    }
+/**
+ * Parse the JSONL line containing `index` and return its object, or null when the line does not
+ * parse (a truncated read or a partial line at a chunk boundary).
+ */
+function parseLineAt(text: string, index: number): any | null {
+  const start = text.lastIndexOf('\n', index) + 1
+  const end = text.indexOf('\n', index)
+  const line = text.slice(start, end === -1 ? undefined : end).trim()
+  if (!line) return null
+
+  try {
+    return JSON.parse(line) as any
+  } catch {
+    return null
   }
+}
+
+/**
+ * Find the last entry of `type` in a transcript window. The window is searched backwards by
+ * substring, and only the candidate lines are parsed: splitting and parsing every line of a 256KB
+ * tail costs milliseconds per session, which adds up to seconds across a large session directory.
+ */
+function findLastEntry(text: string, type: string): any | null {
+  const needle = `"${type}"`
+  let index = text.length
+
+  for (let attempt = 0; attempt < MAX_CANDIDATE_PARSES; attempt += 1) {
+    index = text.lastIndexOf(needle, index - 1)
+    if (index === -1) return null
+
+    const obj = parseLineAt(text, index)
+    if (obj?.type === type) return obj
+  }
+
   return null
 }
 
-function scanSessionInfoNameFromFile(path: string): string | null {
-  // Fallback when the session_info entry is older than our tail window.
-  // Scan the whole file line-by-line and remember the last session_info.name.
-  const fd = openSync(path, 'r')
-  try {
-    const buf = Buffer.alloc(256 * 1024)
-    let leftover = ''
-    let offset = 0
-    let lastName: string | null = null
+function pickTitleFromTail(tail: string): string | null {
+  const entry = findLastEntry(tail, 'session_info')
+  const name = typeof entry?.name === 'string' ? entry.name.trim() : ''
+  return name || null
+}
 
-    while (true) {
-      const n = readSync(fd, buf, 0, buf.length, offset)
-      if (n <= 0) break
-      offset += n
-
-      const chunk = leftover + buf.subarray(0, n).toString('utf8')
-      const lines = chunk.split(/\r?\n/)
-      leftover = lines.pop() ?? ''
-
-      for (const line0 of lines) {
-        const line = line0.trim()
-        if (!line) continue
-        try {
-          const obj = JSON.parse(line) as any
-          if (obj?.type === 'session_info' && typeof obj?.name === 'string' && obj.name.trim()) {
-            lastName = obj.name.trim()
-          }
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    // Best-effort: parse leftover if it was a full line without trailing newline.
-    const tailLine = leftover.trim()
-    if (tailLine) {
-      try {
-        const obj = JSON.parse(tailLine) as any
-        if (obj?.type === 'session_info' && typeof obj?.name === 'string' && obj.name.trim()) {
-          lastName = obj.name.trim()
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    return lastName
-  } catch {
-    return null
-  } finally {
-    try {
-      closeSync(fd)
-    } catch {
-      // ignore
-    }
-  }
+/**
+ * Name set before the session grew past the tail window. pi writes the name as a `session_info`
+ * entry, so only the head window needs checking; scanning whole multi-megabyte transcripts to find
+ * nothing is what made listing sessions take a minute on a large session directory.
+ */
+function pickTitleFromHead(head: string): string | null {
+  return pickTitleFromTail(head)
 }
 
 function pickUpdatedAtFromTail(tail: string): string | null {
   // pi's `/resume` effectively orders sessions by last *message* activity.
-  // We scan backwards and pick the timestamp of the most recent entry with type === "message".
-  const lines = tail.split(/\r?\n/)
+  const message = findLastEntry(tail, 'message')
+  const messageAt = toIsoTimestamp(message?.timestamp)
+  if (messageAt) return messageAt
 
-  // 1) Prefer the most recent message entry.
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim()
-    if (!line) continue
-    try {
-      const obj = JSON.parse(line) as any
-      if (obj?.type !== 'message') continue
-      const ts = typeof obj?.timestamp === 'string' ? obj.timestamp : null
-      if (!ts) continue
-      const d = new Date(ts)
-      if (Number.isFinite(d.getTime())) return d.toISOString()
-    } catch {
-      // ignore
-    }
-  }
+  // Fallback: the most recent entry that carries any timestamp.
+  const needle = '"timestamp"'
+  let index = tail.length
 
-  // 2) Fallback: any valid timestamp (covers sessions that somehow have no messages).
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim()
-    if (!line) continue
-    try {
-      const obj = JSON.parse(line) as any
-      const ts = typeof obj?.timestamp === 'string' ? obj.timestamp : null
-      if (!ts) continue
-      const d = new Date(ts)
-      if (Number.isFinite(d.getTime())) return d.toISOString()
-    } catch {
-      // ignore
-    }
+  for (let attempt = 0; attempt < MAX_CANDIDATE_PARSES; attempt += 1) {
+    index = tail.lastIndexOf(needle, index - 1)
+    if (index === -1) return null
+
+    const at = toIsoTimestamp(parseLineAt(tail, index)?.timestamp)
+    if (at) return at
   }
 
   return null
 }
 
-function pickFallbackTitleFromHead(path: string): string | null {
-  // Fallback to first user message.
-  // NOTE: we keep this simple: read a small head chunk and parse line-by-line.
-  try {
-    const raw = readFileSync(path, { encoding: 'utf8' })
-    const lines = raw.split(/\r?\n/)
-    for (const line0 of lines) {
-      const line = line0.trim()
-      if (!line) continue
-      try {
-        const obj = JSON.parse(line) as any
-        if (obj?.type === 'message' && obj?.message?.role === 'user') {
-          const content = obj?.message?.content
-          if (typeof content === 'string') return content.slice(0, 80)
-          if (Array.isArray(content)) {
-            const t = content.find((c: any) => c?.type === 'text' && typeof c?.text === 'string')
-            if (t?.text) return String(t.text).slice(0, 80)
-          }
+function toIsoTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null
+}
+
+function pickFallbackTitleFromHead(head: string): string | null {
+  // Fallback to first user message. The head window is bounded, so this cannot read a whole file.
+  let lines = 0
+
+  for (const line0 of head.split(/\r?\n/)) {
+    const line = line0.trim()
+    if (!line) continue
+
+    lines += 1
+    if (lines > 2000) break
+
+    try {
+      const obj = JSON.parse(line) as any
+      if (obj?.type === 'message' && obj?.message?.role === 'user') {
+        const content = obj?.message?.content
+        if (typeof content === 'string') return content.slice(0, 80)
+        if (Array.isArray(content)) {
+          const t = content.find((c: any) => c?.type === 'text' && typeof c?.text === 'string')
+          if (t?.text) return String(t.text).slice(0, 80)
         }
-      } catch {
-        // ignore
       }
-
-      // Avoid scanning extremely large files fully.
-      // If we didn't find a user message in the first ~2000 lines, give up.
-      // (Most sessions have it early.)
-      if (lines.length > 2000) break
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
   }
 
   return null
 }
 
-export function listPiSessions(): PiSessionListItem[] {
-  const sessionsDir = getPiSessionsDir()
-  const files: string[] = []
-  walkJsonlFiles(sessionsDir, files)
+/** Read and cache one transcript's header, title and updatedAt. Returns null for non-session files. */
+function readSessionFileInfo(file: string): SessionFileInfo | null {
+  let size = 0
+  let mtimeMs = 0
+  try {
+    const stat = statSync(file)
+    size = stat.size
+    mtimeMs = stat.mtimeMs
+  } catch {
+    return null
+  }
 
-  const items: PiSessionListItem[] = []
+  const cached = fileInfoCache.get(file)
+  if (cached && cached.size === size && cached.mtimeMs === mtimeMs) return cached.info
 
-  for (const file of files) {
-    const first = readFirstLine(file)
-    if (!first) continue
-    const header = parseSessionHeader(first)
-    if (!header) continue
+  let info: SessionFileInfo | null = null
+  const head = readHead(file)
+  const header = parseSessionHeader(firstLineOf(head) ?? '')
 
+  if (header) {
+    let title: string | null = null
     let updatedAt: string | null = null
 
-    let title: string | null = null
     try {
       const tail = readTail(file)
       title = pickTitleFromTail(tail)
@@ -286,12 +261,10 @@ export function listPiSessions(): PiSessionListItem[] {
       // ignore
     }
 
-    // If the session was named early and grew large, it may fall outside of the tail window.
-    if (!title) {
-      title = scanSessionInfoNameFromFile(file)
-    }
+    // A name set before the session grew past the tail window still lives in the head.
+    if (!title) title = pickTitleFromHead(head)
 
-    // Fallback for updatedAt when we couldn't parse timestamps from tail.
+    // Fallback for updatedAt when we could not parse timestamps from the tail.
     if (!updatedAt) {
       try {
         updatedAt = statSync(file).mtime.toISOString()
@@ -300,15 +273,40 @@ export function listPiSessions(): PiSessionListItem[] {
       }
     }
 
-    if (!title) {
-      title = pickFallbackTitleFromHead(file)
+    if (!title) title = pickFallbackTitleFromHead(head)
+
+    info = { sessionId: header.sessionId, cwd: header.cwd, title, updatedAt }
+  }
+
+  fileInfoCache.set(file, { size, mtimeMs, info })
+  return info
+}
+
+export function listPiSessions(): PiSessionListItem[] {
+  const sessionsDir = getPiSessionsDir()
+  const files: string[] = []
+  walkJsonlFiles(sessionsDir, files)
+
+  // Drop cached entries for transcripts that are gone, so a long-lived adapter cannot grow the
+  // cache without bound.
+  if (fileInfoCache.size > files.length) {
+    const present = new Set(files)
+    for (const cachedPath of fileInfoCache.keys()) {
+      if (!present.has(cachedPath)) fileInfoCache.delete(cachedPath)
     }
+  }
+
+  const items: PiSessionListItem[] = []
+
+  for (const file of files) {
+    const info = readSessionFileInfo(file)
+    if (!info) continue
 
     items.push({
-      sessionId: header.sessionId,
-      cwd: header.cwd,
-      title,
-      updatedAt,
+      sessionId: info.sessionId,
+      cwd: info.cwd,
+      title: info.title,
+      updatedAt: info.updatedAt,
       sessionFile: file
     })
   }
@@ -324,8 +322,30 @@ export function listPiSessions(): PiSessionListItem[] {
 }
 
 export function findPiSession(sessionId: string): PiSessionListItem | null {
-  const all = listPiSessions()
-  return all.find(s => s.sessionId === sessionId) ?? null
+  if (!sessionId) return null
+
+  const sessionsDir = getPiSessionsDir()
+  const files: string[] = []
+  walkJsonlFiles(sessionsDir, files)
+
+  // pi names transcript files after the session id, so the matching file is usually found by name
+  // without reading any other transcript. Resolving one session used to list every session first.
+  const byName = files.filter(file => file.includes(sessionId))
+
+  for (const file of [...byName, ...files]) {
+    const info = readSessionFileInfo(file)
+    if (info?.sessionId !== sessionId) continue
+
+    return {
+      sessionId: info.sessionId,
+      cwd: info.cwd,
+      title: info.title,
+      updatedAt: info.updatedAt,
+      sessionFile: file
+    }
+  }
+
+  return null
 }
 
 export function findPiSessionFile(sessionId: string): string | null {
